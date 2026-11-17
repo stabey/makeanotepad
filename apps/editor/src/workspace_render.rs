@@ -29,9 +29,10 @@ use crate::actions::{
     FocusNextPane, FocusPrevPane, OpenCommandPalette, OpenFile, OpenGoToOffset, OpenQuickSwitcher,
     OpenRecoveryCatalog, SelectLanguageAuto, SetEncodingUtf8, SetEncodingUtf8Bom, SetIndentSpaces2,
     SetIndentSpaces4, SetIndentSpaces8, SetIndentTabs2, SetIndentTabs4, SetIndentTabs8,
-    SetLineEndingCrlf, SetLineEndingLf, SplitPaneDown, SplitPaneRight, ToggleFocusActivePane,
-    ToggleShowWhitespace, ToggleSidebar, ToggleSoftWrap, ToggleThemeMode, WORKSPACE_CONTEXT,
-    action_for_language_id,
+    SetLineEndingCrlf, SetLineEndingLf, ShortcutPlatform, SplitPaneDown, SplitPaneRight,
+    ToggleFocusActivePane, ToggleShowWhitespace, ToggleSidebar, ToggleSoftWrap, ToggleThemeMode,
+    UiShortcut, WORKSPACE_CONTEXT, action_for_language_id, empty_pane_quick_actions_banner,
+    palette_footer_hint, shortcut_label,
 };
 use crate::app::{EditorWorkspace, ImageZoomAction, TabSlot};
 use crate::group_ui::pane_ui::{
@@ -46,7 +47,7 @@ use crate::group_ui::{
 use crate::image_view::{ImagePayloadState, ImageTabState};
 use crate::language::{SUPPORTED_LANGUAGES, comment_prefix_for_language, detect_language};
 use crate::paged_view::{PagedSourceState, PagedViewportState, format_bytes};
-use crate::search_bar::{SearchQueryKind, SearchStatus};
+use crate::search_bar::{SearchQueryKind, SearchStatus, format_single_line_match_snippet};
 use crate::shell::{
     PaletteCommandTarget, PaletteMode, disambiguate_paths, disambiguate_single_path_iter,
     display_path_string, file_name_str, matches_palette_filter, parse_palette_query,
@@ -240,7 +241,10 @@ impl EditorWorkspace {
                         IconName::PanelLeftOpen
                     })
                     .selected(sidebar_visible)
-                    .tooltip("Toggle Sidebar (⌘B)")
+                    .tooltip(format!(
+                        "Toggle Sidebar ({})",
+                        shortcut_label(UiShortcut::ToggleSidebar)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_toggle_sidebar(&ToggleSidebar, window, cx);
                     })),
@@ -253,7 +257,7 @@ impl EditorWorkspace {
                     .xsmall()
                     .icon(IconName::Plus)
                     .disabled(lifecycle_busy)
-                    .tooltip("New Tab (⌘N)")
+                    .tooltip(format!("New Tab ({})", shortcut_label(UiShortcut::NewTab)))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.create_untitled_tab(true, window, cx);
                     })),
@@ -266,7 +270,10 @@ impl EditorWorkspace {
                     .xsmall()
                     .icon(IconName::FolderOpen)
                     .disabled(lifecycle_busy)
-                    .tooltip("Open File… (⌘O)")
+                    .tooltip(format!(
+                        "Open File… ({})",
+                        shortcut_label(UiShortcut::OpenFile)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_open_file(&OpenFile, window, cx);
                     })),
@@ -279,7 +286,7 @@ impl EditorWorkspace {
                     .xsmall()
                     .label("Save")
                     .disabled(!can_save_active || active_target.is_none())
-                    .tooltip("Save (⌘S)")
+                    .tooltip(format!("Save ({})", shortcut_label(UiShortcut::SaveFile)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(target) = active_target {
                             this.save_view(target, None, false, false, window, cx);
@@ -298,7 +305,10 @@ impl EditorWorkspace {
                         SharedString::from("Reopen")
                     })
                     .disabled(closed_count == 0 || lifecycle_busy)
-                    .tooltip("Reopen Closed Tab (⇧⌘T)")
+                    .tooltip(format!(
+                        "Reopen Closed Tab ({})",
+                        shortcut_label(UiShortcut::ReopenClosedTab)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.reopen_recently_closed(window, cx);
                     })),
@@ -315,7 +325,10 @@ impl EditorWorkspace {
                     } else {
                         SharedString::from("Drafts")
                     })
-                    .tooltip("Browse Stored Recovery Drafts & Overflow Catalog (⌥⌘B)")
+                    .tooltip(format!(
+                        "Browse Stored Recovery Drafts & Overflow Catalog ({})",
+                        shortcut_label(UiShortcut::OpenRecoveryCatalog)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_open_recovery_catalog(&OpenRecoveryCatalog, window, cx);
                     })),
@@ -373,7 +386,10 @@ impl EditorWorkspace {
                     .icon(IconName::PanelRight)
                     .label("Split Right")
                     .disabled(!can_split_right)
-                    .tooltip("Split Active Pane Right (⌘\\)")
+                    .tooltip(format!(
+                        "Split Active Pane Right ({})",
+                        shortcut_label(UiShortcut::SplitPaneRight)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_split_pane_right(&SplitPaneRight, window, cx);
                     })),
@@ -387,7 +403,10 @@ impl EditorWorkspace {
                     .icon(IconName::PanelBottom)
                     .label("Split Down")
                     .disabled(!can_split_down)
-                    .tooltip("Split Active Pane Down (⇧⌘\\)")
+                    .tooltip(format!(
+                        "Split Active Pane Down ({})",
+                        shortcut_label(UiShortcut::SplitPaneDown)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_split_pane_down(&SplitPaneDown, window, cx);
                     })),
@@ -401,7 +420,10 @@ impl EditorWorkspace {
                         .xsmall()
                         .label("Equalize")
                         .disabled(lifecycle_busy)
-                        .tooltip("Equalize Split Pane Sizes (⌥⌘=)")
+                        .tooltip(format!(
+                            "Equalize Split Pane Sizes ({})",
+                            shortcut_label(UiShortcut::EqualizePanes)
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_equalize_panes(&EqualizePanes, window, cx);
                         })),
@@ -423,7 +445,10 @@ impl EditorWorkspace {
                             "Focus Pane"
                         })
                         .selected(focus_only)
-                        .tooltip("Focus Active Pane Only (⌥⌘Z)")
+                        .tooltip(format!(
+                            "Focus Active Pane Only ({})",
+                            shortcut_label(UiShortcut::FocusActivePaneOnly)
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_toggle_focus_active_pane(&ToggleFocusActivePane, window, cx);
                         })),
@@ -437,7 +462,10 @@ impl EditorWorkspace {
                         .compact()
                         .disabled(lifecycle_busy)
                         .icon(IconName::ChevronLeft)
-                        .tooltip("Focus Previous Pane (⇧F6 / ⌥⌘P)")
+                        .tooltip(format!(
+                            "Focus Previous Pane ({})",
+                            shortcut_label(UiShortcut::FocusPrevPane)
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_focus_prev_pane(&FocusPrevPane, window, cx);
                         })),
@@ -462,7 +490,10 @@ impl EditorWorkspace {
                         .compact()
                         .disabled(lifecycle_busy)
                         .icon(IconName::ChevronRight)
-                        .tooltip("Focus Next Pane (F6 / ⌥⌘N)")
+                        .tooltip(format!(
+                            "Focus Next Pane ({})",
+                            shortcut_label(UiShortcut::FocusNextPane)
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_focus_next_pane(&FocusNextPane, window, cx);
                         })),
@@ -518,7 +549,10 @@ impl EditorWorkspace {
                     .xsmall()
                     .label("Files")
                     .selected(self.palette_visible && self.palette_base_mode == PaletteMode::Files)
-                    .tooltip("Quick Open File / Switch Tab (⌘P)")
+                    .tooltip(format!(
+                        "Quick Open File / Switch Tab ({})",
+                        shortcut_label(UiShortcut::QuickOpen)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_open_quick_switcher(&OpenQuickSwitcher, window, cx);
                     })),
@@ -533,7 +567,10 @@ impl EditorWorkspace {
                     .selected(
                         self.palette_visible && self.palette_base_mode == PaletteMode::Commands,
                     )
-                    .tooltip("Command Palette (⇧⌘P)")
+                    .tooltip(format!(
+                        "Command Palette ({})",
+                        shortcut_label(UiShortcut::CommandPalette)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_open_command_palette(&OpenCommandPalette, window, cx);
                     })),
@@ -547,7 +584,11 @@ impl EditorWorkspace {
                     .icon(IconName::Search)
                     .label("Find")
                     .selected(self.search.visible)
-                    .tooltip("Find / Replace (⌘F / ⌥⌘F)")
+                    .tooltip(format!(
+                        "Find / Replace ({} / {})",
+                        shortcut_label(UiShortcut::Find),
+                        shortcut_label(UiShortcut::Replace)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.search.visible {
                             this.close_overlays(window, cx);
@@ -564,7 +605,10 @@ impl EditorWorkspace {
                     .xsmall()
                     .label("Go To")
                     .selected(self.goto_visible)
-                    .tooltip("Go to Line or Byte Offset (⌘L)")
+                    .tooltip(format!(
+                        "Go to Line or Byte Offset ({})",
+                        shortcut_label(UiShortcut::GoToLineOrByte)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.goto_visible {
                             this.close_overlays(window, cx);
@@ -983,7 +1027,10 @@ impl EditorWorkspace {
                     .xsmall()
                     .icon(IconName::ChevronUp)
                     .disabled(self.search.matches.is_empty())
-                    .tooltip("Previous Match (⇧⌘G)")
+                    .tooltip(format!(
+                        "Previous Match ({})",
+                        shortcut_label(UiShortcut::FindPrev)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_find_prev(&FindPrevMatch, window, cx);
                     })),
@@ -995,7 +1042,10 @@ impl EditorWorkspace {
                     .xsmall()
                     .icon(IconName::ChevronDown)
                     .disabled(self.search.matches.is_empty())
-                    .tooltip("Next Match (⌘G / F3)")
+                    .tooltip(format!(
+                        "Next Match ({})",
+                        shortcut_label(UiShortcut::FindNext)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_find_next(&FindNextMatch, window, cx);
                     })),
@@ -1119,6 +1169,7 @@ impl EditorWorkspace {
                 .border_t_1()
                 .border_color(cx.theme().border)
                 .bg(cx.theme().background)
+                .overflow_hidden()
                 .child(
                     v_virtual_list(
                         entity,
@@ -1136,14 +1187,10 @@ impl EditorWorkspace {
                                         }
                                         None => format!("@0x{:X}", m.byte_range.start),
                                     };
-                                    let preview: &str = &m.preview;
-                                    let hl_start = m.preview_match_range.start.min(preview.len());
-                                    let hl_end =
-                                        m.preview_match_range.end.min(preview.len()).max(hl_start);
-                                    let pre = preview.get(..hl_start).unwrap_or("").to_string();
-                                    let mid =
-                                        preview.get(hl_start..hl_end).unwrap_or("").to_string();
-                                    let post = preview.get(hl_end..).unwrap_or("").to_string();
+                                    let snippet = format_single_line_match_snippet(
+                                        &m.preview,
+                                        m.preview_match_range.clone(),
+                                    );
 
                                     Some(
                                         h_flex()
@@ -1153,6 +1200,8 @@ impl EditorWorkspace {
                                             .px_2p5()
                                             .gap_3()
                                             .items_center()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
                                             .cursor_pointer()
                                             .font_family(mono.clone())
                                             .text_xs()
@@ -1163,8 +1212,10 @@ impl EditorWorkspace {
                                             }))
                                             .child(
                                                 div()
-                                                    .w(px(145.))
+                                                    .w(px(168.))
                                                     .flex_shrink_0()
+                                                    .truncate()
+                                                    .whitespace_nowrap()
                                                     .text_color(cx.theme().muted_foreground)
                                                     .child(format!("#{} {loc}", ix + 1)),
                                             )
@@ -1172,23 +1223,51 @@ impl EditorWorkspace {
                                                 h_flex()
                                                     .flex_1()
                                                     .min_w_0()
+                                                    .h_full()
+                                                    .items_center()
                                                     .overflow_hidden()
-                                                    .child(pre)
+                                                    .whitespace_nowrap()
+                                                    .when(!snippet.pre.is_empty(), |el| {
+                                                        el.child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .whitespace_nowrap()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(snippet.pre),
+                                                        )
+                                                    })
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
+                                                            .whitespace_nowrap()
                                                             .px_0p5()
                                                             .rounded(px(2.))
                                                             .bg(cx.theme().warning.opacity(0.35))
+                                                            .text_color(cx.theme().foreground)
                                                             .font_semibold()
-                                                            .child(mid),
+                                                            .child(snippet.mid),
                                                     )
-                                                    .child(post),
+                                                    .when(!snippet.post.is_empty(), |el| {
+                                                        el.child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .whitespace_nowrap()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(snippet.post),
+                                                        )
+                                                    }),
                                             ),
                                     )
                                 })
                                 .collect()
                         },
                     )
+                    .size_full()
                     .track_scroll(&self.search_results_scroll),
                 )
         });
@@ -1968,7 +2047,10 @@ impl EditorWorkspace {
                     .disabled(lifecycle_busy)
                     .icon(IconName::Plus)
                     .label("Group")
-                    .tooltip("New Tab Group (⌥⌘G) — or drop a tab here")
+                    .tooltip(format!(
+                        "New Tab Group ({}) — or drop a tab here",
+                        shortcut_label(UiShortcut::CreateGroupFromTab)
+                    ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         if this.active_pane_id() != pane_id
@@ -2095,7 +2177,10 @@ impl EditorWorkspace {
                         .compact()
                         .disabled(lifecycle_busy)
                         .icon(IconName::Close)
-                        .tooltip("Close Pane — Merges Open Tabs into Adjacent Pane (⌥⌘X)")
+                        .tooltip(format!(
+                            "Close Pane — Merges Open Tabs into Adjacent Pane ({})",
+                            shortcut_label(UiShortcut::CloseActivePane)
+                        ))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             let _ = this.run_ui_pane_command(
@@ -2212,9 +2297,7 @@ impl EditorWorkspace {
                                 .border_color(cx.theme().border)
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(
-                                    "Quick Actions:  ⌘O Open File  ·  ⌘\\ Split Right  ·  ⇧⌘P Command Palette  ·  ⌥⌘G New Tab Group",
-                                )
+                                .child(empty_pane_quick_actions_banner(ShortcutPlatform::current()))
                                 .child(
                                     h_flex()
                                         .gap_1()
@@ -2547,7 +2630,7 @@ impl EditorWorkspace {
                                 .primary()
                                 .small()
                                 .disabled(lifecycle_busy)
-                                .label("New Tab (⌘N)")
+                                .label(format!("New Tab ({})", shortcut_label(UiShortcut::NewTab)))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.create_untitled_tab(true, window, cx);
                                 })),
@@ -2558,7 +2641,10 @@ impl EditorWorkspace {
                                 .outline()
                                 .small()
                                 .disabled(lifecycle_busy)
-                                .label("Open File… (⌘O)")
+                                .label(format!(
+                                    "Open File… ({})",
+                                    shortcut_label(UiShortcut::OpenFile)
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.on_open_file(&OpenFile, window, cx);
                                 })),
@@ -2571,7 +2657,10 @@ impl EditorWorkspace {
                                 ))
                                 .ghost()
                                 .small()
-                                .label("Command Palette (⇧⌘P)")
+                                .label(format!(
+                                    "Command Palette ({})",
+                                    shortcut_label(UiShortcut::CommandPalette)
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_command_palette(window, cx);
                                 })),
@@ -3636,7 +3725,10 @@ impl EditorWorkspace {
                             .compact()
                             .disabled(lifecycle_busy)
                             .label("+Grp")
-                            .tooltip("New Tab Group from Active Tab (⌥⌘G)")
+                            .tooltip(format!(
+                                "New Tab Group from Active Tab ({})",
+                                shortcut_label(UiShortcut::CreateGroupFromTab)
+                            ))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_create_group_from_active_tab(
                                     &CreateGroupFromActiveTab,
@@ -3654,7 +3746,7 @@ impl EditorWorkspace {
                             .compact()
                             .disabled(lifecycle_busy)
                             .icon(IconName::Plus)
-                            .tooltip("New Tab (⌘N)")
+                            .tooltip(format!("New Tab ({})", shortcut_label(UiShortcut::NewTab)))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.create_untitled_tab(true, window, cx);
                             })),
@@ -3877,7 +3969,10 @@ impl EditorWorkspace {
                     Button::new("sidebar-empty-open")
                         .outline()
                         .xsmall()
-                        .label("Open File… (⌘O)")
+                        .label(format!(
+                            "Open File… ({})",
+                            shortcut_label(UiShortcut::OpenFile)
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_open_file(&OpenFile, window, cx);
                         })),
@@ -4161,7 +4256,7 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Edit: Undo  (⌘Z)".into(),
+                    format!("Edit: Undo  ({})", shortcut_label(UiShortcut::Undo)),
                     &["undo", "revert"],
                     false,
                     !can_edit,
@@ -4170,7 +4265,7 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Edit: Redo  (⇧⌘Z)".into(),
+                    format!("Edit: Redo  ({})", shortcut_label(UiShortcut::Redo)),
                     &["redo"],
                     false,
                     !can_edit,
@@ -4179,22 +4274,22 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Edit: Select All  (⌘A)".into(),
+                    format!(
+                        "Edit: Select All  ({})",
+                        shortcut_label(UiShortcut::SelectAll)
+                    ),
                     &["select all"],
                     false,
                     active_ed.is_none(),
                     PaletteCommandTarget::EditSelectAll,
                 );
-                #[cfg(target_os = "macos")]
-                let (add_cursor_above_hint, add_cursor_below_hint) = ("⌥⌘↑", "⌥⌘↓");
-                #[cfg(target_os = "windows")]
-                let (add_cursor_above_hint, add_cursor_below_hint) = ("Ctrl+Alt+↑", "Ctrl+Alt+↓");
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                let (add_cursor_above_hint, add_cursor_below_hint) = ("Shift+Alt+↑", "Shift+Alt+↓");
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    format!("Selection: Add Cursor Above  ({add_cursor_above_hint})"),
+                    format!(
+                        "Selection: Add Cursor Above  ({})",
+                        shortcut_label(UiShortcut::AddCursorAbove)
+                    ),
                     &["cursor", "multi-cursor", "column", "above"],
                     false,
                     !can_edit,
@@ -4203,7 +4298,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    format!("Selection: Add Cursor Below  ({add_cursor_below_hint})"),
+                    format!(
+                        "Selection: Add Cursor Below  ({})",
+                        shortcut_label(UiShortcut::AddCursorBelow)
+                    ),
                     &["cursor", "multi-cursor", "column", "below"],
                     false,
                     !can_edit,
@@ -4212,7 +4310,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Selection: Indent Lines  (⌘])".into(),
+                    format!(
+                        "Selection: Indent Lines  ({})",
+                        shortcut_label(UiShortcut::IndentLines)
+                    ),
                     &["indent", "tab"],
                     false,
                     !can_edit,
@@ -4221,7 +4322,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Selection: Outdent Lines  (⌘[)".into(),
+                    format!(
+                        "Selection: Outdent Lines  ({})",
+                        shortcut_label(UiShortcut::OutdentLines)
+                    ),
                     &["outdent", "unindent"],
                     false,
                     !can_edit,
@@ -4230,7 +4334,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Line: Duplicate Line / Active Selection  (⇧⌘D)".into(),
+                    format!(
+                        "Line: Duplicate Line / Active Selection  ({})",
+                        shortcut_label(UiShortcut::DuplicateLine)
+                    ),
                     &["duplicate", "copy line", "clone"],
                     false,
                     !can_edit,
@@ -4239,7 +4346,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Line: Delete Line (Active Selection)  (⇧⌘K)".into(),
+                    format!(
+                        "Line: Delete Line (Active Selection)  ({})",
+                        shortcut_label(UiShortcut::DeleteLine)
+                    ),
                     &["delete line", "remove line", "kill line"],
                     false,
                     !can_edit,
@@ -4248,7 +4358,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Line: Move Line Up (Active Selection)  (⌥↑)".into(),
+                    format!(
+                        "Line: Move Line Up (Active Selection)  ({})",
+                        shortcut_label(UiShortcut::MoveLineUp)
+                    ),
                     &["move up", "swap line"],
                     false,
                     !can_edit,
@@ -4257,7 +4370,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut edit_group,
                     &mut edit_targets,
-                    "Line: Move Line Down (Active Selection)  (⌥↓)".into(),
+                    format!(
+                        "Line: Move Line Down (Active Selection)  ({})",
+                        shortcut_label(UiShortcut::MoveLineDown)
+                    ),
                     &["move down", "swap line"],
                     false,
                     !can_edit,
@@ -4265,15 +4381,20 @@ impl EditorWorkspace {
                 );
                 let comment_prefix =
                     active_ed.and_then(|ed| comment_prefix_for_language(ed.language.id));
+                let comment_hint = shortcut_label(UiShortcut::ToggleLineComment);
                 let comment_label = match (active_ed, comment_prefix) {
                     (Some(_), Some(pfx)) => {
-                        format!("Line: Toggle Line Comment ({pfx}, Active Selection)  (⌘/)")
+                        format!(
+                            "Line: Toggle Line Comment ({pfx}, Active Selection)  ({comment_hint})"
+                        )
                     }
                     (Some(ed), None) => format!(
                         "Line: Toggle Line Comment (Unsupported for {})",
                         ed.language.label
                     ),
-                    (None, _) => "Line: Toggle Line Comment (Active Selection)  (⌘/)".into(),
+                    (None, _) => {
+                        format!("Line: Toggle Line Comment (Active Selection)  ({comment_hint})")
+                    }
                 };
                 push_cmd(
                     &mut edit_group,
@@ -4294,7 +4415,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: New Untitled Tab  (⌘N)".into(),
+                    format!(
+                        "File: New Untitled Tab  ({})",
+                        shortcut_label(UiShortcut::NewTab)
+                    ),
                     &["new", "untitled", "scratch"],
                     false,
                     false,
@@ -4303,7 +4427,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Open File…  (⌘O)".into(),
+                    format!(
+                        "File: Open File…  ({})",
+                        shortcut_label(UiShortcut::OpenFile)
+                    ),
                     &["open"],
                     false,
                     false,
@@ -4312,7 +4439,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Quick Open / Switch File…  (⌘P)".into(),
+                    format!(
+                        "File: Quick Open / Switch File…  ({})",
+                        shortcut_label(UiShortcut::QuickOpen)
+                    ),
                     &["quick open", "switch", "recent"],
                     false,
                     false,
@@ -4321,7 +4451,7 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Save  (⌘S)".into(),
+                    format!("File: Save  ({})", shortcut_label(UiShortcut::SaveFile)),
                     &["save", "write"],
                     false,
                     !can_edit,
@@ -4330,7 +4460,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Save As…  (⇧⌘S)".into(),
+                    format!(
+                        "File: Save As…  ({})",
+                        shortcut_label(UiShortcut::SaveFileAs)
+                    ),
                     &["save as", "export"],
                     false,
                     lifecycle_busy || active_ed.is_none(),
@@ -4339,7 +4472,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Reload from Disk  (⌘R)".into(),
+                    format!(
+                        "File: Reload from Disk  ({})",
+                        shortcut_label(UiShortcut::ReloadFromDisk)
+                    ),
                     &["reload", "revert disk"],
                     false,
                     lifecycle_busy || !has_disk_path,
@@ -4348,7 +4484,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Reopen Closed Tab  (⇧⌘T)".into(),
+                    format!(
+                        "File: Reopen Closed Tab  ({})",
+                        shortcut_label(UiShortcut::ReopenClosedTab)
+                    ),
                     &["reopen", "closed"],
                     false,
                     lifecycle_busy || self.recently_closed_count() == 0,
@@ -4357,7 +4496,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "File: Close Active Tab  (⌘W)".into(),
+                    format!(
+                        "File: Close Active Tab  ({})",
+                        shortcut_label(UiShortcut::CloseActiveTab)
+                    ),
                     &["close tab"],
                     false,
                     lifecycle_busy || origin_target.is_none(),
@@ -4375,7 +4517,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "Go: Go to Line / Byte Offset…  (⌘L)".into(),
+                    format!(
+                        "Go: Go to Line / Byte Offset…  ({})",
+                        shortcut_label(UiShortcut::GoToLineOrByte)
+                    ),
                     &["goto", "jump", "offset", "line"],
                     false,
                     false,
@@ -4384,7 +4529,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "Find: Find in Document…  (⌘F)".into(),
+                    format!(
+                        "Find: Find in Document…  ({})",
+                        shortcut_label(UiShortcut::Find)
+                    ),
                     &["find", "search"],
                     false,
                     false,
@@ -4393,7 +4541,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut file_group,
                     &mut file_targets,
-                    "Find: Find and Replace…  (⌥⌘F)".into(),
+                    format!(
+                        "Find: Find and Replace…  ({})",
+                        shortcut_label(UiShortcut::Replace)
+                    ),
                     &["replace"],
                     false,
                     false,
@@ -4409,7 +4560,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut view_group,
                     &mut view_targets,
-                    "View: Toggle Sidebar  (⌘B)".into(),
+                    format!(
+                        "View: Toggle Sidebar  ({})",
+                        shortcut_label(UiShortcut::ToggleSidebar)
+                    ),
                     &["sidebar", "panel", "open editors"],
                     self.shell_state.sidebar_visible,
                     false,
@@ -4418,7 +4572,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut view_group,
                     &mut view_targets,
-                    "View: Toggle Soft Wrap  (⌥Z)".into(),
+                    format!(
+                        "View: Toggle Soft Wrap  ({})",
+                        shortcut_label(UiShortcut::ToggleSoftWrap)
+                    ),
                     &["wrap", "word wrap", "soft wrap"],
                     prefs.soft_wrap,
                     false,
@@ -4676,7 +4833,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut grp_section,
                     &mut grp_targets,
-                    "Group: New Group from Current Tab…  (⌥⌘G)".into(),
+                    format!(
+                        "Group: New Group from Current Tab…  ({})",
+                        shortcut_label(UiShortcut::CreateGroupFromTab)
+                    ),
                     &["group", "create", "new group", "tab"],
                     false,
                     lifecycle_busy,
@@ -4687,7 +4847,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut grp_section,
                     &mut grp_targets,
-                    "Group: New Empty Group…  (⇧⌥⌘G)".into(),
+                    format!(
+                        "Group: New Empty Group…  ({})",
+                        shortcut_label(UiShortcut::CreateEmptyGroup)
+                    ),
                     &["group", "create", "empty"],
                     false,
                     lifecycle_busy,
@@ -4696,13 +4859,14 @@ impl EditorWorkspace {
                     }),
                 );
                 if let Some((gid, gname, gcolor, gcollapsed)) = origin_group_meta {
+                    let toggle_collapse_hint = shortcut_label(UiShortcut::ToggleGroupCollapse);
                     push_cmd(
                         &mut grp_section,
                         &mut grp_targets,
                         if gcollapsed {
-                            format!("Group: Expand \"{gname}\"  (⌥⌘M)")
+                            format!("Group: Expand \"{gname}\"  ({toggle_collapse_hint})")
                         } else {
-                            format!("Group: Collapse \"{gname}\"  (⌥⌘M)")
+                            format!("Group: Collapse \"{gname}\"  ({toggle_collapse_hint})")
                         },
                         &["group", "collapse", "expand", "fold", &gname],
                         gcollapsed,
@@ -4716,7 +4880,10 @@ impl EditorWorkspace {
                         push_cmd(
                             &mut grp_section,
                             &mut grp_targets,
-                            format!("Group: Rename \"{gname}\"…  (⌥⌘R)"),
+                            format!(
+                                "Group: Rename \"{gname}\"…  ({})",
+                                shortcut_label(UiShortcut::RenameGroup)
+                            ),
                             &["group", "rename", "title", &gname],
                             false,
                             lifecycle_busy,
@@ -4742,7 +4909,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut grp_section,
                         &mut grp_targets,
-                        format!("Group: Move Group \"{gname}\" Earlier  (⌥⌘;)"),
+                        format!(
+                            "Group: Move Group \"{gname}\" Earlier  ({})",
+                            shortcut_label(UiShortcut::MoveGroupEarlier)
+                        ),
                         &["group", "reorder", "earlier", "left", &gname],
                         false,
                         lifecycle_busy || !can_grp_earlier,
@@ -4753,7 +4923,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut grp_section,
                         &mut grp_targets,
-                        format!("Group: Move Group \"{gname}\" Later  (⌥⌘')"),
+                        format!(
+                            "Group: Move Group \"{gname}\" Later  ({})",
+                            shortcut_label(UiShortcut::MoveGroupLater)
+                        ),
                         &["group", "reorder", "later", "right", &gname],
                         false,
                         lifecycle_busy || !can_grp_later,
@@ -4766,7 +4939,8 @@ impl EditorWorkspace {
                             &mut grp_section,
                             &mut grp_targets,
                             format!(
-                                "Group: Remove Group \"{gname}\" (Keep Tabs Open in Ungrouped)  (⇧⌥⌘U)"
+                                "Group: Remove Group \"{gname}\" (Keep Tabs Open in Ungrouped)  ({})",
+                                shortcut_label(UiShortcut::RemoveGroupKeepTabs)
                             ),
                             &["group", "remove", "ungroup", "keep tabs", &gname],
                             false,
@@ -4779,7 +4953,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut grp_section,
                         &mut grp_targets,
-                        format!("Group: Close All Tabs in \"{gname}\"…  (⌥⌘W)"),
+                        format!(
+                            "Group: Close All Tabs in \"{gname}\"…  ({})",
+                            shortcut_label(UiShortcut::CloseGroupTabs)
+                        ),
                         &["group", "close group", "close tabs", &gname],
                         false,
                         lifecycle_busy || grp_member_count == 0,
@@ -4792,7 +4969,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut grp_section,
                         &mut grp_targets,
-                        "Group: Move Current Tab Earlier in Group  (⌥⌘[)".into(),
+                        format!(
+                            "Group: Move Current Tab Earlier in Group  ({})",
+                            shortcut_label(UiShortcut::MoveTabEarlierInGroup)
+                        ),
                         &["tab", "move", "reorder", "earlier", "left"],
                         false,
                         lifecycle_busy || !can_tab_earlier,
@@ -4803,7 +4983,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut grp_section,
                         &mut grp_targets,
-                        "Group: Move Current Tab Later in Group  (⌥⌘])".into(),
+                        format!(
+                            "Group: Move Current Tab Later in Group  ({})",
+                            shortcut_label(UiShortcut::MoveTabLaterInGroup)
+                        ),
                         &["tab", "move", "reorder", "later", "right"],
                         false,
                         lifecycle_busy || !can_tab_later,
@@ -4873,29 +5056,41 @@ impl EditorWorkspace {
                 for (dir, label, ok) in [
                     (
                         SplitDirection::Right,
-                        "Pane: Split Pane Right  (⌘\\)",
+                        format!(
+                            "Pane: Split Pane Right  ({})",
+                            shortcut_label(UiShortcut::SplitPaneRight)
+                        ),
                         ok_split_h,
                     ),
                     (
                         SplitDirection::Down,
-                        "Pane: Split Pane Down  (⇧⌘\\)",
+                        format!(
+                            "Pane: Split Pane Down  ({})",
+                            shortcut_label(UiShortcut::SplitPaneDown)
+                        ),
                         ok_split_v,
                     ),
                     (
                         SplitDirection::Left,
-                        "Pane: Split Pane Left  (⌥⌘\\)",
+                        format!(
+                            "Pane: Split Pane Left  ({})",
+                            shortcut_label(UiShortcut::SplitPaneLeft)
+                        ),
                         ok_split_h,
                     ),
                     (
                         SplitDirection::Up,
-                        "Pane: Split Pane Up  (⇧⌥⌘\\)",
+                        format!(
+                            "Pane: Split Pane Up  ({})",
+                            shortcut_label(UiShortcut::SplitPaneUp)
+                        ),
                         ok_split_v,
                     ),
                 ] {
                     push_cmd(
                         &mut pane_section,
                         &mut pane_targets,
-                        label.into(),
+                        label,
                         &["pane", "split", "empty"],
                         false,
                         !ok,
@@ -4914,29 +5109,41 @@ impl EditorWorkspace {
                     for (dir, label, ok) in [
                         (
                             SplitDirection::Right,
-                            "Pane: Split & Move Current Tab Right  (⌥⌘L)",
+                            format!(
+                                "Pane: Split & Move Current Tab Right  ({})",
+                                shortcut_label(UiShortcut::SplitMoveTabRight)
+                            ),
                             ok_split_h,
                         ),
                         (
                             SplitDirection::Down,
-                            "Pane: Split & Move Current Tab Down  (⌥⌘J)",
+                            format!(
+                                "Pane: Split & Move Current Tab Down  ({})",
+                                shortcut_label(UiShortcut::SplitMoveTabDown)
+                            ),
                             ok_split_v,
                         ),
                         (
                             SplitDirection::Left,
-                            "Pane: Split & Move Current Tab Left  (⌥⌘H)",
+                            format!(
+                                "Pane: Split & Move Current Tab Left  ({})",
+                                shortcut_label(UiShortcut::SplitMoveTabLeft)
+                            ),
                             ok_split_h,
                         ),
                         (
                             SplitDirection::Up,
-                            "Pane: Split & Move Current Tab Up  (⌥⌘K)",
+                            format!(
+                                "Pane: Split & Move Current Tab Up  ({})",
+                                shortcut_label(UiShortcut::SplitMoveTabUp)
+                            ),
                             ok_split_v,
                         ),
                     ] {
                         push_cmd(
                             &mut pane_section,
                             &mut pane_targets,
-                            label.into(),
+                            label,
                             &["pane", "split", "move", "tab"],
                             false,
                             !ok,
@@ -4952,7 +5159,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut pane_section,
                         &mut pane_targets,
-                        "Pane: Move Current Tab to Next Pane  (⇧⌥⌘N)".into(),
+                        format!(
+                            "Pane: Move Current Tab to Next Pane  ({})",
+                            shortcut_label(UiShortcut::MoveTabNextPane)
+                        ),
                         &["pane", "move", "next"],
                         false,
                         lifecycle_busy || total_panes <= 1,
@@ -4967,7 +5177,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut pane_section,
                         &mut pane_targets,
-                        "Pane: Move Current Tab to Previous Pane  (⇧⌥⌘P)".into(),
+                        format!(
+                            "Pane: Move Current Tab to Previous Pane  ({})",
+                            shortcut_label(UiShortcut::MoveTabPrevPane)
+                        ),
                         &["pane", "move", "previous"],
                         false,
                         lifecycle_busy || total_panes <= 1,
@@ -4985,7 +5198,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut pane_section,
                         &mut pane_targets,
-                        "Pane: Split Right (New Read-Only View)  (⇧⌥⌘L)".into(),
+                        format!(
+                            "Pane: Split Right (New Read-Only View)  ({})",
+                            shortcut_label(UiShortcut::SplitCloneViewRight)
+                        ),
                         &["pane", "split", "clone", "read-only", "view"],
                         false,
                         !can_clone_readonly || !ok_split_h,
@@ -4994,7 +5210,10 @@ impl EditorWorkspace {
                     push_cmd(
                         &mut pane_section,
                         &mut pane_targets,
-                        "Pane: Split Down (New Read-Only View)  (⇧⌥⌘J)".into(),
+                        format!(
+                            "Pane: Split Down (New Read-Only View)  ({})",
+                            shortcut_label(UiShortcut::SplitCloneViewDown)
+                        ),
                         &["pane", "split", "clone", "read-only", "view"],
                         false,
                         !can_clone_readonly || !ok_split_v,
@@ -5032,7 +5251,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut pane_section,
                     &mut pane_targets,
-                    "Pane: Focus Next Pane  (F6 / ⌥⌘N)".into(),
+                    format!(
+                        "Pane: Focus Next Pane  ({})",
+                        shortcut_label(UiShortcut::FocusNextPane)
+                    ),
                     &["pane", "focus", "cycle", "next"],
                     false,
                     lifecycle_busy || total_panes <= 1,
@@ -5043,7 +5265,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut pane_section,
                     &mut pane_targets,
-                    "Pane: Focus Previous Pane  (⇧F6 / ⌥⌘P)".into(),
+                    format!(
+                        "Pane: Focus Previous Pane  ({})",
+                        shortcut_label(UiShortcut::FocusPrevPane)
+                    ),
                     &["pane", "focus", "cycle", "previous"],
                     false,
                     lifecycle_busy || total_panes <= 1,
@@ -5054,7 +5279,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut pane_section,
                     &mut pane_targets,
-                    "Pane: Equalize Split Pane Sizes  (⌥⌘=)".into(),
+                    format!(
+                        "Pane: Equalize Split Pane Sizes  ({})",
+                        shortcut_label(UiShortcut::EqualizePanes)
+                    ),
                     &["pane", "equalize", "ratio", "balance"],
                     false,
                     lifecycle_busy || total_panes <= 1,
@@ -5063,13 +5291,14 @@ impl EditorWorkspace {
                     )),
                 );
                 let focus_only_now = self.is_focus_only();
+                let focus_only_hint = shortcut_label(UiShortcut::FocusActivePaneOnly);
                 push_cmd(
                     &mut pane_section,
                     &mut pane_targets,
                     if focus_only_now {
-                        "Pane: Exit Focus-Only Mode (Show All Panes)  (⌥⌘Z)".into()
+                        format!("Pane: Exit Focus-Only Mode (Show All Panes)  ({focus_only_hint})")
                     } else {
-                        "Pane: Focus Active Pane Only  (⌥⌘Z)".into()
+                        format!("Pane: Focus Active Pane Only  ({focus_only_hint})")
                     },
                     &["pane", "focus", "zoom", "maximize"],
                     focus_only_now,
@@ -5083,7 +5312,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut pane_section,
                     &mut pane_targets,
-                    "Pane: Close Active Pane (Merge Tabs into Adjacent Pane)  (⌥⌘X)".into(),
+                    format!(
+                        "Pane: Close Active Pane (Merge Tabs into Adjacent Pane)  ({})",
+                        shortcut_label(UiShortcut::CloseActivePane)
+                    ),
                     &["pane", "close pane", "merge"],
                     false,
                     lifecycle_busy || total_panes <= 1,
@@ -5096,7 +5328,10 @@ impl EditorWorkspace {
                 push_cmd(
                     &mut pane_section,
                     &mut pane_targets,
-                    "Pane: Close All Tabs in Active Pane…  (⇧⌥⌘W)".into(),
+                    format!(
+                        "Pane: Close All Tabs in Active Pane…  ({})",
+                        shortcut_label(UiShortcut::CloseActivePaneTabs)
+                    ),
                     &["pane", "close tabs"],
                     false,
                     lifecycle_busy || origin_pane_tab_count == 0,
@@ -5117,13 +5352,14 @@ impl EditorWorkspace {
                 let rec_unplaced = rec_summary
                     .unplaced_checkpoints
                     .saturating_add(rec_summary.unplaced_other);
+                let recovery_hint = shortcut_label(UiShortcut::OpenRecoveryCatalog);
                 let catalog_label = if rec_unplaced > 0 {
                     format!(
-                        "Recovery: Browse Draft Catalog ({rec_unplaced} deferred / {} total)…  (⌥⌘B)",
+                        "Recovery: Browse Draft Catalog ({rec_unplaced} deferred / {} total)…  ({recovery_hint})",
                         rec_summary.total_eligible
                     )
                 } else {
-                    "Recovery: Browse Stored Drafts & Overflow Catalog…  (⌥⌘B)".to_string()
+                    format!("Recovery: Browse Stored Drafts & Overflow Catalog…  ({recovery_hint})")
                 };
                 push_cmd(
                     &mut rec_section,
@@ -5202,12 +5438,10 @@ impl EditorWorkspace {
         let entity_q = cx.entity();
         let entity_c = cx.entity();
         let entity_x = cx.entity();
-        let mode_hint = match effective.mode {
-            PaletteMode::Commands => "↑↓ Navigate  ·  ↵ Run Command  ·  Esc Dismiss",
-            PaletteMode::Files => {
-                "↑↓ Navigate  ·  ↵ Open File / Tab  ·  Type > for Commands  ·  Esc Dismiss"
-            }
-        };
+        let mode_hint = palette_footer_hint(
+            matches!(effective.mode, PaletteMode::Commands),
+            ShortcutPlatform::current(),
+        );
 
         cmd = cmd
             .on_query(move |_, _, cx| {
@@ -5684,7 +5918,10 @@ impl EditorWorkspace {
                         "Wrap: Off"
                     })
                     .selected(prefs.soft_wrap)
-                    .tooltip("Toggle Soft Wrap (⌥Z)")
+                    .tooltip(format!(
+                        "Toggle Soft Wrap ({})",
+                        shortcut_label(UiShortcut::ToggleSoftWrap)
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_toggle_soft_wrap(&ToggleSoftWrap, window, cx);
                     })),

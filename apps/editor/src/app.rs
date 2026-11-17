@@ -71,7 +71,7 @@ use crate::line_ops::{LineOpKind, LineOpPlan, plan_line_op, plan_toggle_comment_
 use crate::paged_view::{PagedSourceState, PagedViewportState, format_bytes, parse_jump_query};
 use crate::search_bar::{
     SearchQueryKind, SearchSessionState, SearchStatus, plan_replacement_edits,
-    run_editable_extended_search,
+    populate_editable_match_line_numbers, run_editable_extended_search,
 };
 use crate::shell::{
     EarlyShellOverrides, EditorViewPrefs, HonestSlotBadge, PaletteCommandTarget, PaletteMode,
@@ -610,6 +610,19 @@ impl EditorWorkspace {
         }
         let prev_count = self.search.matches.len();
         if self.search.poll_streaming_events(32) {
+            if self.search.matches.len() > prev_count
+                && let Some(target) = self.search.target_view
+                && self.session.resolve(target).is_ok()
+                && let Some(TabSlot::Editable(ed)) = self
+                    .documents
+                    .get(&target.document.doc_id)
+                    .filter(|s| s.document_key() == target.document)
+            {
+                populate_editable_match_line_numbers(
+                    ed.committed_rope(),
+                    &mut self.search.matches[prev_count..],
+                );
+            }
             if self.search.matches.len() != prev_count {
                 self.rebuild_search_item_sizes();
             }

@@ -1266,6 +1266,10 @@ async fn run_full_scenario(
     )
     .await?;
 
+    // 7b. Multi-line Editable C-code LiteralStreaming search regression:
+    // verifies 0-based `line_number` population via the live background pump and single-line snippet extraction.
+    verify_multiline_c_search_regression(window_handle, workspace, &work_dir, cx).await?;
+
     // 8. Reconstitute an empty, uncheckpointed document through the real retry path,
     // then verify its metadata-only association after shutdown and restart.
     let clean_untitled_id = window_handle
@@ -1608,6 +1612,180 @@ async fn run_search_and_wait(
             other => Err(format!("unexpected search status: {other:?}")),
         }
     })
+}
+
+async fn verify_multiline_c_search_regression(
+    window_handle: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    work_dir: &Path,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let c_fixture_text = "header\n\n```bash\n#include <stdio.h>\n#include <stdlib.h>\n";
+    let c_fixture_path = work_dir.join("multiline_c_search_fixture.c");
+    std::fs::write(&c_fixture_path, c_fixture_text.as_bytes())
+        .map_err(|e| format!("write multiline C search fixture: {e}"))?;
+    let c_canonical =
+        std::fs::canonicalize(&c_fixture_path).unwrap_or_else(|_| c_fixture_path.clone());
+
+    let (prev_limit, prev_active_target) = window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                let prev_limit = ws.cli.editable_byte_limit;
+                let prev_active = ws.active_view_id().and_then(|id| ws.view_target(id));
+                ws.cli.editable_byte_limit = None;
+                ws.open_path(c_canonical.clone(), window, cx);
+                (prev_limit, prev_active)
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until(
+        Duration::from_secs(10),
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && matches!(
+                        ws.active_slot(),
+                        Some(TabSlot::Editable(ed))
+                            if ed.meta.path.as_deref() == Some(c_canonical.as_path())
+                    )
+            })
+        },
+        "multiline C search fixture open",
+    )
+    .await?;
+
+    let (c_target, c_view_id, c_doc_id) = cx.update(|cx| -> Result<_, String> {
+        let ws = workspace.read(cx);
+        let view_id = ws
+            .active_view_id()
+            .ok_or_else(|| "missing active view for multiline C fixture".to_string())?;
+        let target = ws
+            .view_target(view_id)
+            .ok_or_else(|| "missing target for multiline C fixture".to_string())?;
+        let Some(TabSlot::Editable(ed)) = ws.active_slot() else {
+            return Err("multiline C search fixture did not open as Editable".to_string());
+        };
+        if ed.committed_rope().to_string() != c_fixture_text {
+            return Err(format!(
+                "multiline C search fixture rope mismatch: got {:?}",
+                ed.committed_rope().to_string()
+            ));
+        }
+        Ok((target, view_id, ed.doc_id))
+    })?;
+
+    for algorithm in [
+        SearchAlgorithm::MemchrBaseline,
+        SearchAlgorithm::ByteScanExperiment,
+    ] {
+        let hits = run_search_and_wait(window_handle, workspace, "include", algorithm, cx).await?;
+        if hits != 2 {
+            return Err(format!(
+                "multiline C search ({algorithm:?}) expected 2 hits, got {hits}"
+            ));
+        }
+
+        cx.update(|cx| -> Result<(), String> {
+            let ws = workspace.read(cx);
+            if ws.search.target_view != Some(c_target) {
+                return Err(format!(
+                    "multiline C search ({algorithm:?}) targeted unexpected view: {:?} vs {:?}",
+                    ws.search.target_view,
+                    Some(c_target)
+                ));
+            }
+            if ws.search.matches.len() != 2 {
+                return Err(format!(
+                    "multiline C search ({algorithm:?}) expected matches.len() == 2, got {}",
+                    ws.search.matches.len()
+                ));
+            }
+            let expected = [
+                (Some(3), "#", "include", " <stdio.h>"),
+                (Some(4), "#", "include", " <stdlib.h>"),
+            ];
+            for (ix, (exp_line, exp_pre, exp_mid, exp_post)) in expected.iter().enumerate() {
+                let m = &ws.search.matches[ix];
+                if m.line_number != *exp_line {
+                    return Err(format!(
+                        "multiline C search ({algorithm:?}) match[{ix}] line_number={:?}, expected {:?}",
+                        m.line_number, exp_line
+                    ));
+                }
+                let snippet = crate::search_bar::format_single_line_match_snippet(
+                    &m.preview,
+                    m.preview_match_range.clone(),
+                );
+                if snippet.pre.contains(['\n', '\r'])
+                    || snippet.mid.contains(['\n', '\r'])
+                    || snippet.post.contains(['\n', '\r'])
+                {
+                    return Err(format!(
+                        "multiline C search ({algorithm:?}) match[{ix}] snippet contains newline: {snippet:?}"
+                    ));
+                }
+                if snippet.pre != *exp_pre
+                    || snippet.mid != *exp_mid
+                    || snippet.post != *exp_post
+                {
+                    return Err(format!(
+                        "multiline C search ({algorithm:?}) match[{ix}] snippet={snippet:?}, expected ({exp_pre:?}, {exp_mid:?}, {exp_post:?})"
+                    ));
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    // Exercise rendering the Search Results drawer with multi-line C-code match snippets.
+    pump_frame(window_handle, cx)?;
+
+    window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.close_overlays(window, cx);
+                ws.search.clear_results();
+                ws.rebuild_search_item_sizes();
+                ws.request_close_view(c_target, window, cx);
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until(
+        Duration::from_secs(10),
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && !ws.session_layout().views.contains_key(&c_view_id)
+                    && !ws.documents.contains_key(&c_doc_id)
+            })
+        },
+        "closing multiline C search fixture tab",
+    )
+    .await?;
+
+    window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.cli.editable_byte_limit = prev_limit;
+                ws.search_query_input.update(cx, |s, cx| {
+                    s.set_value("", window, cx);
+                });
+                if let Some(prev) = prev_active_target
+                    && ws.session.resolve(prev).is_ok()
+                {
+                    ws.activate_view(prev, window, cx);
+                }
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 fn write_deterministic_paged_fixture(path: &Path, lines: usize) -> std::io::Result<usize> {

@@ -662,6 +662,125 @@ fn bounded_preview(text: &str, range: Range<usize>) -> (Box<str>, Range<usize>) 
     (slice.into(), match_start..match_end)
 }
 
+const MAX_SNIPPET_PRE_CHARS: usize = 48;
+const MAX_SNIPPET_MID_CHARS: usize = 96;
+const MAX_SNIPPET_POST_CHARS: usize = 120;
+
+/// Single-line sanitized search match snippet split into prefix, matched span, and suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleLineMatchSnippet {
+    pub pre: String,
+    pub mid: String,
+    pub post: String,
+}
+
+fn floor_char_boundary(s: &str, ix: usize) -> usize {
+    let mut ix = ix.min(s.len());
+    while ix > 0 && !s.is_char_boundary(ix) {
+        ix -= 1;
+    }
+    ix
+}
+
+fn sanitize_snippet_segment(segment: &str, collapse_newlines: bool) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut chars = segment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' if collapse_newlines => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('↵');
+            }
+            '\n' if collapse_newlines => out.push('↵'),
+            '\t' => out.push(' '),
+            c if c < ' ' || c == '\x7f' => out.push('·'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn truncate_leading_with_ellipsis(s: String, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s;
+    }
+    let start_byte = s
+        .char_indices()
+        .nth(count - max_chars)
+        .map(|(ix, _)| ix)
+        .unwrap_or(s.len());
+    let mut out = String::with_capacity('…'.len_utf8() + (s.len() - start_byte));
+    out.push('…');
+    out.push_str(&s[start_byte..]);
+    out
+}
+
+fn truncate_trailing_with_ellipsis(s: String, max_chars: usize) -> String {
+    let Some((cutoff_byte, _)) = s.char_indices().nth(max_chars) else {
+        return s;
+    };
+    let mut out = String::with_capacity(cutoff_byte + '…'.len_utf8());
+    out.push_str(&s[..cutoff_byte]);
+    out.push('…');
+    out
+}
+
+/// Formats a raw multi-line `SearchMatch.preview` and `preview_match_range` into bounded
+/// single-line `pre` / `mid` / `post` segments safe for fixed-height result list rows.
+pub fn format_single_line_match_snippet(
+    preview: &str,
+    match_range: Range<usize>,
+) -> SingleLineMatchSnippet {
+    let hl_start = floor_char_boundary(preview, match_range.start);
+    let hl_end = floor_char_boundary(preview, match_range.end.min(preview.len()).max(hl_start));
+
+    let raw_pre = &preview[..hl_start];
+    let same_line_pre = match raw_pre.rfind(['\n', '\r']) {
+        Some(pos) => &raw_pre[pos + 1..],
+        None => raw_pre,
+    }
+    .trim_start_matches([' ', '\t']);
+    let pre = truncate_leading_with_ellipsis(
+        sanitize_snippet_segment(same_line_pre, false),
+        MAX_SNIPPET_PRE_CHARS,
+    );
+
+    let mid = truncate_trailing_with_ellipsis(
+        sanitize_snippet_segment(&preview[hl_start..hl_end], true),
+        MAX_SNIPPET_MID_CHARS,
+    );
+
+    let raw_post = &preview[hl_end..];
+    let same_line_post = match raw_post.find(['\r', '\n']) {
+        Some(pos) => &raw_post[..pos],
+        None => raw_post,
+    }
+    .trim_end_matches([' ', '\t']);
+    let post = truncate_trailing_with_ellipsis(
+        sanitize_snippet_segment(same_line_post, false),
+        MAX_SNIPPET_POST_CHARS,
+    );
+
+    SingleLineMatchSnippet { pre, mid, post }
+}
+
+/// Populates missing 0-based `line_number` values for streaming literal matches on an Editable
+/// `Rope` snapshot without overwriting existing `Some(...)` line numbers.
+pub fn populate_editable_match_line_numbers(rope: &Rope, matches: &mut [SearchMatch]) {
+    let rope_len = rope.len();
+    for m in matches {
+        if m.line_number.is_none() {
+            let byte_ix = usize::try_from(m.byte_range.start)
+                .unwrap_or(rope_len)
+                .min(rope_len);
+            m.line_number = Some(rope.byte_to_line_idx(byte_ix, LineType::LF) as u64);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +863,161 @@ mod tests {
             edits,
             vec![(0..7, "[10]".to_string()), (9..16, "[20]".to_string())]
         );
+    }
+
+    fn assert_single_line_invariants(snippet: &SingleLineMatchSnippet) {
+        for part in [&snippet.pre, &snippet.mid, &snippet.post] {
+            assert!(!part.contains('\n'), "unexpected LF in {part:?}");
+            assert!(!part.contains('\r'), "unexpected CR in {part:?}");
+            assert!(!part.contains('\t'), "unexpected TAB in {part:?}");
+        }
+    }
+
+    #[test]
+    fn single_line_snippet_extracts_matching_line_from_multiline_c_preview() {
+        let preview = "写入以下代码\n\n```bash\n#include <stdio.h>\n#include <stdlib.h>\n#include <pthread.h>\n";
+        let start = preview.find("include").expect("include present");
+        let end = start + "include".len();
+        let snippet = format_single_line_match_snippet(preview, start..end);
+        assert_eq!(
+            snippet,
+            SingleLineMatchSnippet {
+                pre: "#".to_string(),
+                mid: "include".to_string(),
+                post: " <stdio.h>".to_string(),
+            }
+        );
+        assert_single_line_invariants(&snippet);
+    }
+
+    #[test]
+    fn single_line_snippet_trims_crlf_and_leading_indentation() {
+        let preview = "prev\r\n    long long *v = calloc(1024);\r\nnext";
+        let start = preview.find("calloc").expect("calloc present");
+        let end = start + "calloc".len();
+        let snippet = format_single_line_match_snippet(preview, start..end);
+        assert_eq!(
+            snippet,
+            SingleLineMatchSnippet {
+                pre: "long long *v = ".to_string(),
+                mid: "calloc".to_string(),
+                post: "(1024);".to_string(),
+            }
+        );
+        assert_single_line_invariants(&snippet);
+
+        // Tab-indented prefix + trailing whitespace + internal tabs/controls are sanitized cleanly.
+        let tab_preview = "hdr\r\n\t\talpha\t\x01  beta  \t \r\ntail";
+        let b_start = tab_preview.find("beta").expect("beta");
+        let b_end = b_start + "beta".len();
+        let tab_snippet = format_single_line_match_snippet(tab_preview, b_start..b_end);
+        assert_eq!(tab_snippet.pre, "alpha ·  ");
+        assert_eq!(tab_snippet.mid, "beta");
+        assert_eq!(tab_snippet.post, "");
+        assert_single_line_invariants(&tab_snippet);
+    }
+
+    #[test]
+    fn single_line_snippet_collapses_multiline_match_newlines() {
+        let preview = "before\r\nalpha\r\nbeta\r\nafter";
+        let start = preview.find("alpha").expect("alpha");
+        let end = start + "alpha\r\nbeta".len();
+        let snippet = format_single_line_match_snippet(preview, start..end);
+        assert_eq!(
+            snippet,
+            SingleLineMatchSnippet {
+                pre: "".to_string(),
+                mid: "alpha↵beta".to_string(),
+                post: "".to_string(),
+            }
+        );
+        assert_single_line_invariants(&snippet);
+
+        // Direct LF / CR / CRLF sequence inside mid collapses properly.
+        let direct = format_single_line_match_snippet("alpha\r\nbeta", 0.."alpha\r\nbeta".len());
+        assert_eq!(direct.mid, "alpha↵beta");
+        let lf_cr = format_single_line_match_snippet("a\nb\rc", 0..5);
+        assert_eq!(lf_cr.mid, "a↵b↵c");
+        assert_single_line_invariants(&lf_cr);
+    }
+
+    #[test]
+    fn single_line_snippet_truncates_long_multibyte_cjk_with_ellipsis() {
+        let pre_text = "甲乙丙丁戊己庚辛壬癸".repeat(6); // 60 CJK chars (> 48)
+        let mid_text = "中".repeat(100); // 100 CJK chars (> 96)
+        let post_text = "子丑寅卯辰巳午未申酉戌亥".repeat(12); // 144 CJK chars (> 120)
+        let preview = format!("{pre_text}{mid_text}{post_text}");
+        let mid_start = pre_text.len();
+        let mid_end = mid_start + mid_text.len();
+
+        // Also exercise clamping from mid-UTF-8 byte offsets safely.
+        let snippet = format_single_line_match_snippet(&preview, mid_start..mid_end);
+        assert_single_line_invariants(&snippet);
+        assert!(snippet.pre.starts_with('…'));
+        assert_eq!(snippet.pre.chars().count(), 49);
+        assert_eq!(
+            snippet.pre,
+            format!("…{}", pre_text.chars().skip(12).collect::<String>())
+        );
+
+        assert!(snippet.mid.ends_with('…'));
+        assert_eq!(snippet.mid.chars().count(), 97);
+        assert_eq!(
+            snippet.mid,
+            format!("{}…", mid_text.chars().take(96).collect::<String>())
+        );
+
+        assert!(snippet.post.ends_with('…'));
+        assert_eq!(snippet.post.chars().count(), 121);
+        assert_eq!(
+            snippet.post,
+            format!("{}…", post_text.chars().take(120).collect::<String>())
+        );
+
+        // Mid-UTF-8-char and out-of-bounds range never panics.
+        let clamped = format_single_line_match_snippet("中文测试", 1..999);
+        assert_eq!(clamped.pre, "");
+        assert_eq!(clamped.mid, "中文测试");
+        assert_eq!(clamped.post, "");
+    }
+
+    #[test]
+    fn populate_editable_match_line_numbers_fills_missing_without_overwriting() {
+        let rope = Rope::from_str("zero\none\r\ntwo\nthree target\nfour");
+        let three_pos = rope.to_string().find("three").expect("three present");
+        let four_pos = rope.to_string().find("four").expect("four present");
+        let mut matches = vec![
+            SearchMatch {
+                byte_range: 0..4,
+                line_number: None,
+                preview: "zero".into(),
+                preview_match_range: 0..4,
+            },
+            SearchMatch {
+                byte_range: (three_pos as u64)..((three_pos + 5) as u64),
+                line_number: None,
+                preview: "three target".into(),
+                preview_match_range: 0..5,
+            },
+            SearchMatch {
+                byte_range: (four_pos as u64)..((four_pos + 4) as u64),
+                line_number: Some(99),
+                preview: "four".into(),
+                preview_match_range: 0..4,
+            },
+            SearchMatch {
+                byte_range: 99_999..100_005,
+                line_number: None,
+                preview: "".into(),
+                preview_match_range: 0..0,
+            },
+        ];
+
+        populate_editable_match_line_numbers(&rope, &mut matches);
+
+        assert_eq!(matches[0].line_number, Some(0));
+        assert_eq!(matches[1].line_number, Some(3));
+        assert_eq!(matches[2].line_number, Some(99));
+        assert_eq!(matches[3].line_number, Some(4));
     }
 }

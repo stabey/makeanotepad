@@ -228,6 +228,16 @@ pub fn register_bindings_and_menus(cx: &mut gpui_kit::App) {
         KeyBinding::new("ctrl-/", ToggleComment, Some(EDITOR_MODE_CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-r", ReloadActiveDocument, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-r", ReloadActiveDocument, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("f5", ReloadActiveDocument, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-shift-z",
+            gpui_kit::component::input::Redo,
+            Some("Input"),
+        ),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-q", QuitEditor, None),
         #[cfg(not(target_os = "macos"))]
@@ -532,4 +542,373 @@ pub fn register_bindings_and_menus(cx: &mut gpui_kit::App) {
             MenuItem::action("Close All Tabs in Active Pane…", CloseActivePaneTabs),
         ]),
     ]);
+}
+
+/// Target desktop OS family used to format keyboard shortcut labels in UI chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutPlatform {
+    MacOs,
+    Windows,
+    Linux,
+}
+
+impl ShortcutPlatform {
+    /// Returns the shortcut presentation platform for the current compile target.
+    pub const fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOs
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Self::Linux
+        }
+    }
+}
+
+/// Centralized UI shortcut identifiers whose displayed key labels vary by platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiShortcut {
+    ToggleSidebar,
+    NewTab,
+    OpenFile,
+    SaveFile,
+    SaveFileAs,
+    ReloadFromDisk,
+    CloseActiveTab,
+    ReopenClosedTab,
+    OpenRecoveryCatalog,
+    QuickOpen,
+    CommandPalette,
+    Find,
+    Replace,
+    FindNext,
+    FindPrev,
+    GoToLineOrByte,
+    ToggleSoftWrap,
+    Undo,
+    Redo,
+    SelectAll,
+    AddCursorAbove,
+    AddCursorBelow,
+    IndentLines,
+    OutdentLines,
+    DuplicateLine,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
+    ToggleLineComment,
+    CreateGroupFromTab,
+    CreateEmptyGroup,
+    ToggleGroupCollapse,
+    RenameGroup,
+    MoveGroupEarlier,
+    MoveGroupLater,
+    RemoveGroupKeepTabs,
+    CloseGroupTabs,
+    MoveTabEarlierInGroup,
+    MoveTabLaterInGroup,
+    SplitPaneRight,
+    SplitPaneDown,
+    SplitPaneLeft,
+    SplitPaneUp,
+    SplitMoveTabRight,
+    SplitMoveTabDown,
+    SplitMoveTabLeft,
+    SplitMoveTabUp,
+    MoveTabNextPane,
+    MoveTabPrevPane,
+    SplitCloneViewRight,
+    SplitCloneViewDown,
+    FocusNextPane,
+    FocusPrevPane,
+    EqualizePanes,
+    FocusActivePaneOnly,
+    CloseActivePane,
+    CloseActivePaneTabs,
+}
+
+impl UiShortcut {
+    /// Every `UiShortcut` variant, exposed for exhaustive platform label verification.
+    pub const ALL: &'static [Self] = &[
+        Self::ToggleSidebar,
+        Self::NewTab,
+        Self::OpenFile,
+        Self::SaveFile,
+        Self::SaveFileAs,
+        Self::ReloadFromDisk,
+        Self::CloseActiveTab,
+        Self::ReopenClosedTab,
+        Self::OpenRecoveryCatalog,
+        Self::QuickOpen,
+        Self::CommandPalette,
+        Self::Find,
+        Self::Replace,
+        Self::FindNext,
+        Self::FindPrev,
+        Self::GoToLineOrByte,
+        Self::ToggleSoftWrap,
+        Self::Undo,
+        Self::Redo,
+        Self::SelectAll,
+        Self::AddCursorAbove,
+        Self::AddCursorBelow,
+        Self::IndentLines,
+        Self::OutdentLines,
+        Self::DuplicateLine,
+        Self::DeleteLine,
+        Self::MoveLineUp,
+        Self::MoveLineDown,
+        Self::ToggleLineComment,
+        Self::CreateGroupFromTab,
+        Self::CreateEmptyGroup,
+        Self::ToggleGroupCollapse,
+        Self::RenameGroup,
+        Self::MoveGroupEarlier,
+        Self::MoveGroupLater,
+        Self::RemoveGroupKeepTabs,
+        Self::CloseGroupTabs,
+        Self::MoveTabEarlierInGroup,
+        Self::MoveTabLaterInGroup,
+        Self::SplitPaneRight,
+        Self::SplitPaneDown,
+        Self::SplitPaneLeft,
+        Self::SplitPaneUp,
+        Self::SplitMoveTabRight,
+        Self::SplitMoveTabDown,
+        Self::SplitMoveTabLeft,
+        Self::SplitMoveTabUp,
+        Self::MoveTabNextPane,
+        Self::MoveTabPrevPane,
+        Self::SplitCloneViewRight,
+        Self::SplitCloneViewDown,
+        Self::FocusNextPane,
+        Self::FocusPrevPane,
+        Self::EqualizePanes,
+        Self::FocusActivePaneOnly,
+        Self::CloseActivePane,
+        Self::CloseActivePaneTabs,
+    ];
+
+    const fn platform_labels(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::ToggleSidebar => ("⌘B", "Ctrl+B", "Ctrl+B"),
+            Self::NewTab => ("⌘N", "Ctrl+N", "Ctrl+N"),
+            Self::OpenFile => ("⌘O", "Ctrl+O", "Ctrl+O"),
+            Self::SaveFile => ("⌘S", "Ctrl+S", "Ctrl+S"),
+            Self::SaveFileAs => ("⇧⌘S", "Ctrl+Shift+S", "Ctrl+Shift+S"),
+            Self::ReloadFromDisk => ("⌘R", "Ctrl+R", "Ctrl+R"),
+            Self::CloseActiveTab => ("⌘W", "Ctrl+W", "Ctrl+W"),
+            Self::ReopenClosedTab => ("⇧⌘T", "Ctrl+Shift+T", "Ctrl+Shift+T"),
+            Self::OpenRecoveryCatalog => ("⌥⌘B", "Ctrl+Alt+B", "Ctrl+Alt+B"),
+            Self::QuickOpen => ("⌘P", "Ctrl+P", "Ctrl+P"),
+            Self::CommandPalette => ("⇧⌘P", "Ctrl+Shift+P", "Ctrl+Shift+P"),
+            Self::Find => ("⌘F", "Ctrl+F", "Ctrl+F"),
+            Self::Replace => ("⌥⌘F", "Ctrl+H", "Ctrl+H"),
+            Self::FindNext => ("⌘G / F3", "F3", "F3"),
+            Self::FindPrev => ("⇧⌘G", "Shift+F3", "Shift+F3"),
+            Self::GoToLineOrByte => ("⌘L", "Ctrl+G", "Ctrl+G"),
+            Self::ToggleSoftWrap => ("⌥Z", "Alt+Z", "Alt+Z"),
+            Self::Undo => ("⌘Z", "Ctrl+Z", "Ctrl+Z"),
+            Self::Redo => ("⇧⌘Z", "Ctrl+Y", "Ctrl+Y"),
+            Self::SelectAll => ("⌘A", "Ctrl+A", "Ctrl+A"),
+            Self::AddCursorAbove => ("⌥⌘↑", "Ctrl+Alt+Up", "Shift+Alt+Up"),
+            Self::AddCursorBelow => ("⌥⌘↓", "Ctrl+Alt+Down", "Shift+Alt+Down"),
+            Self::IndentLines => ("⌘]", "Ctrl+]", "Ctrl+]"),
+            Self::OutdentLines => ("⌘[", "Ctrl+[", "Ctrl+["),
+            Self::DuplicateLine => ("⇧⌘D", "Ctrl+Shift+D", "Ctrl+Shift+D"),
+            Self::DeleteLine => ("⇧⌘K", "Ctrl+Shift+K", "Ctrl+Shift+K"),
+            Self::MoveLineUp => ("⌥↑", "Alt+Up", "Alt+Up"),
+            Self::MoveLineDown => ("⌥↓", "Alt+Down", "Alt+Down"),
+            Self::ToggleLineComment => ("⌘/", "Ctrl+/", "Ctrl+/"),
+            Self::CreateGroupFromTab => ("⌥⌘G", "Ctrl+Alt+G", "Ctrl+Alt+G"),
+            Self::CreateEmptyGroup => ("⇧⌥⌘G", "Ctrl+Alt+Shift+G", "Ctrl+Alt+Shift+G"),
+            Self::ToggleGroupCollapse => ("⌥⌘M", "Ctrl+Alt+M", "Ctrl+Alt+M"),
+            Self::RenameGroup => ("⌥⌘R", "Ctrl+Alt+R", "Ctrl+Alt+R"),
+            Self::MoveGroupEarlier => ("⌥⌘;", "Ctrl+Alt+;", "Ctrl+Alt+;"),
+            Self::MoveGroupLater => ("⌥⌘'", "Ctrl+Alt+'", "Ctrl+Alt+'"),
+            Self::RemoveGroupKeepTabs => ("⇧⌥⌘U", "Ctrl+Alt+Shift+U", "Ctrl+Alt+Shift+U"),
+            Self::CloseGroupTabs => ("⌥⌘W", "Ctrl+Alt+W", "Ctrl+Alt+W"),
+            Self::MoveTabEarlierInGroup => ("⌥⌘[", "Ctrl+Alt+[", "Ctrl+Alt+["),
+            Self::MoveTabLaterInGroup => ("⌥⌘]", "Ctrl+Alt+]", "Ctrl+Alt+]"),
+            Self::SplitPaneRight => ("⌘\\", "Ctrl+\\", "Ctrl+\\"),
+            Self::SplitPaneDown => ("⇧⌘\\", "Ctrl+Shift+\\", "Ctrl+Shift+\\"),
+            Self::SplitPaneLeft => ("⌥⌘\\", "Ctrl+Alt+\\", "Ctrl+Alt+\\"),
+            Self::SplitPaneUp => ("⇧⌥⌘\\", "Ctrl+Alt+Shift+\\", "Ctrl+Alt+Shift+\\"),
+            Self::SplitMoveTabRight => ("⌥⌘L", "Ctrl+Alt+L", "Ctrl+Alt+L"),
+            Self::SplitMoveTabDown => ("⌥⌘J", "Ctrl+Alt+J", "Ctrl+Alt+J"),
+            Self::SplitMoveTabLeft => ("⌥⌘H", "Ctrl+Alt+H", "Ctrl+Alt+H"),
+            Self::SplitMoveTabUp => ("⌥⌘K", "Ctrl+Alt+K", "Ctrl+Alt+K"),
+            Self::MoveTabNextPane => ("⇧⌥⌘N", "Ctrl+Alt+Shift+N", "Ctrl+Alt+Shift+N"),
+            Self::MoveTabPrevPane => ("⇧⌥⌘P", "Ctrl+Alt+Shift+P", "Ctrl+Alt+Shift+P"),
+            Self::SplitCloneViewRight => ("⇧⌥⌘L", "Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+L"),
+            Self::SplitCloneViewDown => ("⇧⌥⌘J", "Ctrl+Alt+Shift+J", "Ctrl+Alt+Shift+J"),
+            Self::FocusNextPane => ("F6 / ⌥⌘N", "F6 / Ctrl+Alt+N", "F6 / Ctrl+Alt+N"),
+            Self::FocusPrevPane => (
+                "⇧F6 / ⌥⌘P",
+                "Shift+F6 / Ctrl+Alt+P",
+                "Shift+F6 / Ctrl+Alt+P",
+            ),
+            Self::EqualizePanes => ("⌥⌘=", "Ctrl+Alt+=", "Ctrl+Alt+="),
+            Self::FocusActivePaneOnly => ("⌥⌘Z", "Ctrl+Alt+Z", "Ctrl+Alt+Z"),
+            Self::CloseActivePane => ("⌥⌘X", "Ctrl+Alt+X", "Ctrl+Alt+X"),
+            Self::CloseActivePaneTabs => ("⇧⌥⌘W", "Ctrl+Alt+Shift+W", "Ctrl+Alt+Shift+W"),
+        }
+    }
+
+    /// Returns the human-readable shortcut label for `platform`.
+    pub const fn label_for(self, platform: ShortcutPlatform) -> &'static str {
+        let (macos, windows, linux) = self.platform_labels();
+        match platform {
+            ShortcutPlatform::MacOs => macos,
+            ShortcutPlatform::Windows => windows,
+            ShortcutPlatform::Linux => linux,
+        }
+    }
+}
+
+/// Returns the shortcut label for `s` formatted for the current runtime platform.
+pub const fn shortcut_label(s: UiShortcut) -> &'static str {
+    s.label_for(ShortcutPlatform::current())
+}
+
+/// Formats the empty-pane quick-actions banner for `platform`.
+pub fn empty_pane_quick_actions_banner(platform: ShortcutPlatform) -> String {
+    format!(
+        "Quick Actions:  {} Open File  ·  {} Split Right  ·  {} Command Palette  ·  {} New Tab Group",
+        UiShortcut::OpenFile.label_for(platform),
+        UiShortcut::SplitPaneRight.label_for(platform),
+        UiShortcut::CommandPalette.label_for(platform),
+        UiShortcut::CreateGroupFromTab.label_for(platform),
+    )
+}
+
+/// Returns the command palette / quick-open footer navigation hint for `platform`.
+pub const fn palette_footer_hint(is_commands: bool, platform: ShortcutPlatform) -> &'static str {
+    match (platform, is_commands) {
+        (ShortcutPlatform::MacOs, true) => "↑↓ Navigate  ·  ↵ Run Command  ·  Esc Dismiss",
+        (ShortcutPlatform::MacOs, false) => {
+            "↑↓ Navigate  ·  ↵ Open File / Tab  ·  Type > for Commands  ·  Esc Dismiss"
+        }
+        (ShortcutPlatform::Windows | ShortcutPlatform::Linux, true) => {
+            "Up/Down Navigate  ·  Enter Run Command  ·  Esc Dismiss"
+        }
+        (ShortcutPlatform::Windows | ShortcutPlatform::Linux, false) => {
+            "Up/Down Navigate  ·  Enter Open File / Tab  ·  Type > for Commands  ·  Esc Dismiss"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ShortcutPlatform, UiShortcut, empty_pane_quick_actions_banner, palette_footer_hint,
+        shortcut_label,
+    };
+
+    const MACOS_SYMBOLS: [char; 8] = ['⌘', '⌥', '⇧', '⌃', '↵', '⌫', '⇥', '⎋'];
+
+    fn assert_no_macos_symbols(text: &str, context: &str) {
+        assert!(
+            !text.chars().any(|ch| MACOS_SYMBOLS.contains(&ch)),
+            "unexpected macOS symbol in {context}: {text:?}"
+        );
+    }
+
+    #[test]
+    fn windows_and_linux_labels_are_non_empty_and_contain_no_macos_symbols() {
+        assert_eq!(UiShortcut::ALL.len(), 57);
+        for (idx, &a) in UiShortcut::ALL.iter().enumerate() {
+            for &b in &UiShortcut::ALL[idx + 1..] {
+                assert_ne!(a, b, "duplicate UiShortcut in ALL");
+            }
+            assert!(
+                !a.label_for(ShortcutPlatform::MacOs).is_empty(),
+                "empty macOS label for {a:?}"
+            );
+            for platform in [ShortcutPlatform::Windows, ShortcutPlatform::Linux] {
+                let label = a.label_for(platform);
+                assert!(!label.is_empty(), "empty label for {a:?} on {platform:?}");
+                assert_no_macos_symbols(label, &format!("{a:?} on {platform:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn banner_and_palette_hints_contain_no_macos_symbols_on_windows_and_linux() {
+        for platform in [ShortcutPlatform::Windows, ShortcutPlatform::Linux] {
+            let banner = empty_pane_quick_actions_banner(platform);
+            assert_no_macos_symbols(&banner, &format!("quick actions banner on {platform:?}"));
+            for is_commands in [true, false] {
+                let hint = palette_footer_hint(is_commands, platform);
+                assert_no_macos_symbols(
+                    hint,
+                    &format!("palette_footer_hint({is_commands}) on {platform:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expected_platform_specific_labels_match() {
+        assert_eq!(
+            UiShortcut::OpenFile.label_for(ShortcutPlatform::Windows),
+            "Ctrl+O"
+        );
+        assert_eq!(
+            UiShortcut::Replace.label_for(ShortcutPlatform::Windows),
+            "Ctrl+H"
+        );
+        assert_eq!(
+            UiShortcut::FindNext.label_for(ShortcutPlatform::Windows),
+            "F3"
+        );
+        assert_eq!(
+            UiShortcut::FindPrev.label_for(ShortcutPlatform::Windows),
+            "Shift+F3"
+        );
+        assert_eq!(
+            UiShortcut::GoToLineOrByte.label_for(ShortcutPlatform::Windows),
+            "Ctrl+G"
+        );
+        assert_eq!(
+            UiShortcut::Redo.label_for(ShortcutPlatform::Windows),
+            "Ctrl+Y"
+        );
+        assert_eq!(
+            UiShortcut::ReloadFromDisk.label_for(ShortcutPlatform::Windows),
+            "Ctrl+R"
+        );
+        assert_eq!(
+            UiShortcut::AddCursorAbove.label_for(ShortcutPlatform::Windows),
+            "Ctrl+Alt+Up"
+        );
+
+        assert_eq!(
+            UiShortcut::AddCursorAbove.label_for(ShortcutPlatform::Linux),
+            "Shift+Alt+Up"
+        );
+        assert_eq!(
+            UiShortcut::AddCursorBelow.label_for(ShortcutPlatform::Linux),
+            "Shift+Alt+Down"
+        );
+
+        assert_eq!(
+            UiShortcut::OpenFile.label_for(ShortcutPlatform::MacOs),
+            "⌘O"
+        );
+        assert_eq!(
+            UiShortcut::FindNext.label_for(ShortcutPlatform::MacOs),
+            "⌘G / F3"
+        );
+
+        assert_eq!(
+            shortcut_label(UiShortcut::OpenFile),
+            UiShortcut::OpenFile.label_for(ShortcutPlatform::current())
+        );
+    }
 }
