@@ -3375,10 +3375,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
             .max(bounds.size.height),
         );
 
-        // TODO: should be add some gap to right, to convenient to focus on boundary position
+        // Add gap to right, to be convenient to focus on boundary position
         if last_layout.text_align == TextAlign::Right || last_layout.text_align == TextAlign::Center
         {
-            scroll_size.width = longest_line_width + line_number_width;
+            scroll_size.width = longest_line_width + line_number_width + RIGHT_MARGIN;
         }
 
         // `position_for_index` for example

@@ -8,7 +8,7 @@ This project targets Rust, GPUI / GPUI Kit, and a user-selected nsh integration.
 
 ## Routing and ownership
 
-- The main session is the sole coordinator and integration owner. Its project default is Astra low; it scopes work, establishes contracts and file ownership, dispatches agents, and tracks acceptance. Do not use low-effort orchestration as a substitute for unresolved architecture decisions.
+- The main session is the sole coordinator and integration owner. Its project default is Gemini 4 Carbon high; it scopes work, establishes contracts and file ownership, dispatches agents, and tracks acceptance. Do not use low-effort orchestration as a substitute for unresolved architecture decisions.
 - Dispatch by exact agent name without overriding its model: editor-ui for native UI, editor-core for Rust core/platform work, design-review for proposals and contract checks, runtime-verify for integrated execution, adversarial-check only for targeted high-risk review.
 - Child agents do not delegate. These orchestration duties apply to the main session, not to children that inherit this rule.
 - Give each assignment its goal, non-goals, writable files, shared interfaces, state/thread ownership, acceptance criteria, and escalation conditions. One writer owns each file at a time.
@@ -28,6 +28,6 @@ This project targets Rust, GPUI / GPUI Kit, and a user-selected nsh integration.
 
 Launch omp from the project root so .omp/config.yml is loaded. Its modelRoles.default sets the default for new sessions; an active/resumed session or explicit CLI model can keep another selection. To explicitly start the coordinator use:
 
-    omp --model openai-codex/gpt-6-astra --thinking low
+    omp --model yeexing/gemini-4-carbon --thinking high
 
 The project agents and rules do not install global agents or alter other projects. Provider authentication remains outside this preset. .omp/config.yml and .omp/agent-architect.json are locally ignored; collaborators must configure their own matching modelRoles before using the committed agents. Changing a role requires updating the project config and installation manifest together. To uninstall, remove the files and owned roles listed under templates.custom in the manifest, preserving unrelated additions.
