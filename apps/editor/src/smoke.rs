@@ -115,6 +115,9 @@ pub struct SmokeReport {
     pub startup_group_count: usize,
     pub startup_inactive_hydrated_count: usize,
     pub startup_cli_overflow_active_hydrated_verified: bool,
+    pub pending_wrap_rows_after_first_draw: usize,
+    pub full_wrap_converged_ms: Option<f64>,
+    pub columnar_multicursor_single_undo_verified: bool,
     #[serde(skip)]
     pub expected_session_layout: Option<SessionLayout>,
     #[serde(skip)]
@@ -197,7 +200,17 @@ pub fn spawn_smoke_runner(
         report.total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         match run_result {
             Ok(()) => {
-                report.in_app_checks_passed = true;
+                if matches!(scenario, SmokeScenario::Usability)
+                    && !report.columnar_multicursor_single_undo_verified
+                {
+                    report.in_app_checks_passed = false;
+                    report.failure_reason = Some(
+                        "usability scenario finished without columnar_multicursor_single_undo_verified"
+                            .to_string(),
+                    );
+                } else {
+                    report.in_app_checks_passed = true;
+                }
             }
             Err(err) => {
                 report.in_app_checks_passed = false;
@@ -322,8 +335,50 @@ async fn run_startup_scenario(
     // Pump real window draw frames so Metal layout/text shaping executes.
     let _ = window_handle.update(cx, |_, window, cx| {
         window.refresh();
-        let _ = window.draw(cx);
+        window.draw(cx).clear(cx);
     });
+    let pending_wrap_rows = cx.update(|cx| match workspace.read(cx).active_slot() {
+        Some(TabSlot::Editable(ed)) => ed.pending_wrap_rows(cx),
+        _ => 0,
+    });
+    report.pending_wrap_rows_after_first_draw = pending_wrap_rows;
+
+    let await_full_wrap =
+        std::env::var_os("EDITOR_SMOKE_AWAIT_FULL_WRAP").is_some_and(|v| v == "1");
+    if await_full_wrap {
+        if pending_wrap_rows == 0 {
+            report.full_wrap_converged_ms =
+                Some(cx.update(|cx| {
+                    workspace.read(cx).process_start.elapsed().as_secs_f64() * 1000.0
+                }));
+        } else {
+            let wrap_deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    })
+                    .map_err(|e| format!("await full wrap draw failed: {e}"))?;
+                let remaining = cx.update(|cx| match workspace.read(cx).active_slot() {
+                    Some(TabSlot::Editable(ed)) => ed.pending_wrap_rows(cx),
+                    _ => 0,
+                });
+                if remaining == 0 {
+                    report.full_wrap_converged_ms = Some(cx.update(|cx| {
+                        workspace.read(cx).process_start.elapsed().as_secs_f64() * 1000.0
+                    }));
+                    break;
+                }
+                if Instant::now() >= wrap_deadline {
+                    return Err(format!(
+                        "timed out waiting for full wrap convergence ({remaining} pending rows)"
+                    ));
+                }
+                sleep_ms(1, cx).await;
+            }
+        }
+    }
     sleep_ms(40, cx).await;
 
     window_handle
@@ -1585,7 +1640,7 @@ fn pump_frame(window_handle: &AnyWindowHandle, cx: &mut AsyncApp) -> Result<(), 
     window_handle
         .update(cx, |_, window, cx| {
             window.refresh();
-            let _ = window.draw(cx);
+            window.draw(cx).clear(cx);
         })
         .map_err(|e| format!("pump_frame failed: {e}"))
 }
@@ -1602,6 +1657,42 @@ fn dispatch_smoke_key(
             window.dispatch_keystroke(keystroke, cx);
         })
         .map_err(|e| e.to_string())?;
+    pump_frame(window_handle, cx)
+}
+
+fn dispatch_smoke_text(
+    window_handle: &AnyWindowHandle,
+    cx: &mut AsyncApp,
+    text: &str,
+) -> Result<(), String> {
+    for ch in text.chars() {
+        pump_frame(window_handle, cx)?;
+        let s = ch.to_string();
+        let stroke = gpui_kit::Keystroke {
+            modifiers: gpui_kit::Modifiers::default(),
+            key: s.clone(),
+            key_char: Some(s),
+        };
+        window_handle
+            .update(cx, |_, window, cx| {
+                window.dispatch_keystroke(stroke, cx);
+            })
+            .map_err(|e| format!("dispatch_smoke_text '{ch}' failed: {e}"))?;
+        pump_frame(window_handle, cx)?;
+    }
+    Ok(())
+}
+
+fn dispatch_smoke_mouse(
+    window_handle: &AnyWindowHandle,
+    cx: &mut AsyncApp,
+    input: gpui_kit::PlatformInput,
+) -> Result<(), String> {
+    window_handle
+        .update(cx, |_, window, cx| {
+            window.dispatch_event(input, cx);
+        })
+        .map_err(|e| format!("dispatch_smoke_mouse failed: {e}"))?;
     pump_frame(window_handle, cx)
 }
 
@@ -2672,10 +2763,290 @@ async fn run_usability_scenario(
     report.format_only_bom_restart_and_save_verified = true;
     report.mru_persistence_verified = true;
 
+    // =========================================================================
+    // 7. Rectangular (Alt+Shift Drag) & Vertical Multi-Cursor (AddCursorBelow)
+    // =========================================================================
+    verify_columnar_and_multicursor_native(window_handle, workspace, cx).await?;
+    report.columnar_multicursor_single_undo_verified = true;
+    if !report.columnar_multicursor_single_undo_verified {
+        return Err("columnar/multi-cursor verification flag not set".to_string());
+    }
+
     pump_frame(window_handle, cx)?;
     cx.update(|cx| {
         capture_workspace_metrics(workspace.read(cx), report);
     });
+    Ok(())
+}
+
+async fn verify_columnar_and_multicursor_native(
+    window_handle: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let columnar_sample = "col_alpha_123\r\ncol_x\r\ncol_中文_999\r\n";
+    let undo_key = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+
+    // Use a fresh untitled tab so `recent_files` MRU ordering stays intact for post-shutdown checks.
+    let col_target = window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| -> Result<ViewTarget, String> {
+                let target = ws.create_untitled_tab(true, window, cx).ok_or_else(|| {
+                    "missing untitled tab for columnar/multicursor check".to_string()
+                })?;
+                let ed = ws
+                    .active_editable_mut()
+                    .ok_or_else(|| "new columnar tab is not Editable".to_string())?;
+                let editor_entity = ed.editor().clone();
+                editor_entity.update(cx, |state, cx| {
+                    state.replace_text_in_range(None, columnar_sample, window, cx);
+                    state.set_selected_range(4..4, cx);
+                    state.focus(window, cx);
+                });
+                Ok(target)
+            })
+        })
+        .map_err(|e| e.to_string())??;
+
+    pump_frame(window_handle, cx)?;
+    pump_frame(window_handle, cx)?;
+
+    // Check A: AddCursorBelow x2 from byte 4 -> 3 cursors across uneven CRLF + UTF-8 lines.
+    let rev_before_multi = window_handle
+        .update(cx, |_, window, cx| -> Result<Revision, String> {
+            let ws = workspace.read(cx);
+            let Some(TabSlot::Editable(ed)) = ws.view_slot(col_target.view_id) else {
+                return Err("columnar tab missing before AddCursorBelow".into());
+            };
+            let state = ed.editor().read(cx);
+            if !state.focus_handle(cx).is_focused(window) || state.cursor() != 4 {
+                return Err(format!(
+                    "unexpected initial focus/cursor for AddCursorBelow: focused={} cursor={}",
+                    state.focus_handle(cx).is_focused(window),
+                    state.cursor()
+                ));
+            }
+            if ed.committed_rope().to_string() != columnar_sample {
+                return Err("columnar initial buffer mismatch".into());
+            }
+            Ok(ed.visible_revision)
+        })
+        .map_err(|e| e.to_string())??;
+
+    for _ in 0..2 {
+        window_handle
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(gpui_kit::base::input::AddCursorBelow), cx);
+            })
+            .map_err(|e| format!("AddCursorBelow dispatch failed: {e}"))?;
+        pump_frame(window_handle, cx)?;
+    }
+
+    dispatch_smoke_text(window_handle, cx, "ab")?;
+    let expected_after_multi = "col_abalpha_123\r\ncol_abx\r\ncol_ab中文_999\r\n";
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(col_target.view_id) else {
+            return Err("columnar tab missing after AddCursorBelow typing".into());
+        };
+        let committed = ed.committed_rope().to_string();
+        let native = ed.editor().read(cx).text().to_string();
+        if committed != expected_after_multi || native != expected_after_multi {
+            return Err(format!(
+                "AddCursorBelow multi-cursor insert mismatch: committed={committed:?} native={native:?}"
+            ));
+        }
+        if ed.visible_revision != Revision(rev_before_multi.0 + 2) {
+            return Err(format!(
+                "AddCursorBelow typing did not commit atomically once per keystroke: before={} after={}",
+                rev_before_multi.0, ed.visible_revision.0
+            ));
+        }
+        Ok(())
+    })?;
+
+    // Single Undo reverts coalesced multi-cursor typing across all 3 lines.
+    dispatch_smoke_key(window_handle, cx, undo_key)?;
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(col_target.view_id) else {
+            return Err("columnar tab missing after AddCursorBelow Undo".into());
+        };
+        let committed = ed.committed_rope().to_string();
+        let native = ed.editor().read(cx).text().to_string();
+        if committed != columnar_sample || native != columnar_sample {
+            return Err(format!(
+                "single Undo after AddCursorBelow typing did not restore exact CRLF/UTF-8 text: {committed:?}"
+            ));
+        }
+        if ed.visible_revision != Revision(rev_before_multi.0 + 3) {
+            return Err(format!(
+                "single Undo after AddCursorBelow did not advance revision by 1: before={} after={}",
+                rev_before_multi.0, ed.visible_revision.0
+            ));
+        }
+        Ok(())
+    })?;
+
+    // Check B: Alt+Shift rectangular mouse block selection across uneven CRLF + UTF-8 rows.
+    pump_frame(window_handle, cx)?;
+    let (start_pt, end_pt, rev_before_block) = window_handle
+        .update(
+            cx,
+            |_, _, cx| -> Result<
+                (
+                    gpui_kit::Point<gpui_kit::Pixels>,
+                    gpui_kit::Point<gpui_kit::Pixels>,
+                    Revision,
+                ),
+                String,
+            > {
+                let ws = workspace.read(cx);
+                let Some(TabSlot::Editable(ed)) = ws.view_slot(col_target.view_id) else {
+                    return Err("columnar tab missing before Alt+Shift drag".into());
+                };
+                let state = ed.editor().read(cx);
+                let b_start = state
+                    .range_to_bounds(&(4..4))
+                    .ok_or_else(|| "missing range_to_bounds for row 0 col 4".to_string())?;
+                // Byte 32 sits right after "col_中文" on row 2; -0.5px keeps x inside '文'.
+                let b_end = state
+                    .range_to_bounds(&(32..32))
+                    .ok_or_else(|| "missing range_to_bounds for row 2 col 10".to_string())?;
+                let start_pt = gpui_kit::point(
+                    b_start.origin.x + gpui_kit::px(0.5),
+                    b_start.origin.y + b_start.size.height * 0.5,
+                );
+                let end_pt = gpui_kit::point(
+                    b_end.origin.x - gpui_kit::px(0.5),
+                    b_end.origin.y + b_end.size.height * 0.5,
+                );
+                let input_bounds = state.input_bounds();
+                if !input_bounds.contains(&start_pt) || !input_bounds.contains(&end_pt) {
+                    return Err(format!(
+                        "computed columnar drag points outside input_bounds {input_bounds:?}: start={start_pt:?} end={end_pt:?}"
+                    ));
+                }
+                Ok((start_pt, end_pt, ed.visible_revision))
+            },
+        )
+        .map_err(|e| e.to_string())??;
+
+    let alt_shift = gpui_kit::Modifiers {
+        alt: true,
+        shift: true,
+        ..Default::default()
+    };
+    dispatch_smoke_mouse(
+        window_handle,
+        cx,
+        gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+            position: start_pt,
+            pressed_button: None,
+            modifiers: alt_shift,
+        }),
+    )?;
+    dispatch_smoke_mouse(
+        window_handle,
+        cx,
+        gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+            button: gpui_kit::MouseButton::Left,
+            position: start_pt,
+            modifiers: alt_shift,
+            click_count: 1,
+            first_mouse: false,
+        }),
+    )?;
+    dispatch_smoke_mouse(
+        window_handle,
+        cx,
+        gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+            position: end_pt,
+            pressed_button: Some(gpui_kit::MouseButton::Left),
+            modifiers: alt_shift,
+        }),
+    )?;
+    dispatch_smoke_mouse(
+        window_handle,
+        cx,
+        gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
+            button: gpui_kit::MouseButton::Left,
+            position: end_pt,
+            modifiers: alt_shift,
+            click_count: 1,
+        }),
+    )?;
+
+    dispatch_smoke_text(window_handle, cx, "z")?;
+    let expected_after_block = "col_z123\r\ncol_z\r\ncol_z_999\r\n";
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(col_target.view_id) else {
+            return Err("columnar tab missing after Alt+Shift block edit".into());
+        };
+        let committed = ed.committed_rope().to_string();
+        let native = ed.editor().read(cx).text().to_string();
+        if committed != expected_after_block || native != expected_after_block {
+            return Err(format!(
+                "Alt+Shift rectangular edit mismatch (CRLF or UTF-8 broken?): committed={committed:?} native={native:?}"
+            ));
+        }
+        if ed.visible_revision != Revision(rev_before_block.0 + 1) {
+            return Err(format!(
+                "Alt+Shift rectangular replacement did not advance revision atomically by 1: before={} after={}",
+                rev_before_block.0, ed.visible_revision.0
+            ));
+        }
+        Ok(())
+    })?;
+
+    dispatch_smoke_key(window_handle, cx, undo_key)?;
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(col_target.view_id) else {
+            return Err("columnar tab missing after Alt+Shift Undo".into());
+        };
+        let committed = ed.committed_rope().to_string();
+        let native = ed.editor().read(cx).text().to_string();
+        if committed != columnar_sample || native != columnar_sample {
+            return Err(format!(
+                "single Undo after Alt+Shift block edit did not restore original bytes: {committed:?}"
+            ));
+        }
+        if ed.visible_revision != Revision(rev_before_block.0 + 2) {
+            return Err(format!(
+                "single Undo after Alt+Shift block edit did not advance revision by 1: before={} after={}",
+                rev_before_block.0, ed.visible_revision.0
+            ));
+        }
+        Ok(())
+    })?;
+
+    wait_until(
+        Duration::from_secs(10),
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                matches!(
+                    ws.view_slot(col_target.view_id),
+                    Some(TabSlot::Editable(ed))
+                        if ed.doc_id == col_target.document.doc_id
+                            && ed.is_dirty()
+                            && ed.durable_revision >= ed.visible_revision
+                            && ed.durable_revision.0 > 0
+                            && !ed.has_pending_native_edit(cx)
+                )
+            })
+        },
+        "durable SQLite checkpoint after columnar/multi-cursor verification",
+    )
+    .await?;
+
     Ok(())
 }
 

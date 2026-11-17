@@ -292,3 +292,42 @@ CI下载产物的额外运行见[报告](evidence/ime-ci-macos-native.json)、[O
 
 - [ADR013绘制后启动采样](evidence/adr013-sample-after-draw.txt)绑定PID 28484（`short_repeated`夹具，[同进程报告](evidence/adr013-sampled-startup.json)确认exit 0与durable ACK）：主线程共613个样本，其中AppKit首次加载`+[NSTextInputContext initialize]`占233个样本，`TextElement::prepaint`降至124个样本（`DisplayMap::on_layout_changed` 78个、`ensure_prepared_for_layout`初始行树构建45个），`grapheme_indices`与`unicode_linebreak`均为0样本；`update_wrapped`内部剩余样本主要集中在`ropey::Lines`分片读取、宽度表哈希查找及`SumTree`节点分配。采样运行的计时不并入上方未插桩均值。
 - **剩余风险**：全唯一百万短行在首次`prepaint`仍同步对全部1,048,576行执行`TextSystem::shape_line`（底层CoreText `CTLineCreateWithAttributedString`），即使`WidthMeasurements`本体限制在32,768条/4 MiB，系统字体整形与百万行`SumTree`仍带来约2.27 GiB峰值与7.38秒首屏等待。后续需评估视口优先或分块渐进折行，以及多文档长期驻留堆分布；上述数据仍仅代表本机macOS ARM64 warm/unspecified状态，不代表冷盘、物理屏幕像素首帧或Windows/Linux性能。
+
+## 有界整形缓存与视口优先渐进折行：ADR 016 同夹具配对基准
+
+采用ADR 016：`WindowTextSystem`在每256次未命中时轮换`LineLayoutCache`，移除`wrap_width = None`预构建并改为视口优先渐进折行（`SYNC_WRAP_ROW_BUDGET = 4,096`，`visible_range +/- 128`与`cursor_row +/- 64`精确同步保障，后台每帧6 ms预算分块收敛，零字形宽度近似）。以下配对基准在同一台`macOS 27.2.1 arm64 / Mac16,10 / 32 GiB RAM`主机上串行执行，夹具与全新恢复目录位于`/tmp/adr016_bench_work`，未清除OS缓存（**warm/unspecified**），不代表冷盘NVMe或Windows/Linux桌面性能。原始数据见[ADR 016配对基准](evidence/adr015-016-startup-paired.json)。
+
+### 被测二进制与夹具标识
+
+- **旧版（ADR 016前，即ADR 013+014 release `editor`）**：SHA-256 `3d409f369905c6c2e55e319b3bfda9a4da52f88f3f8525cb1226fa68439ac2fd`
+- **新版（`target/release/editor`）**：SHA-256 `2d5203aea8fa7f49566a333aecaee8356d3fa8e86d630a7e9e8a54e69cb91778`（配对服务二进制`target/release/editor-services`：`1da9a18f8803023dba3f2fa8c99f4a644dc93e02f04797cce8a95720a89877f1`）
+- **三种67,108,860 B（64 MiB − 4 B）普通文本夹具**：全部实际hydrate `1`个可编辑编辑器、`67,108,860 B`正文、`0`个分页标签并收到正常退出durable ACK：
+  - `short_repeated`：64 B周期短行（SHA-256 `8f38c099...`）
+  - `short_unique`：1,048,575行唯一64 B ASCII + 60 B尾行（SHA-256 `e34d8e6c...`）
+  - `long_64k`：1,023 × 65,536 B长行 + 65,532 B尾行（SHA-256 `45afb910...`）
+
+### 双口径实测：首帧就绪 vs 100% 全量折行收敛
+
+为避免将“首帧仅折行视口附近行”与“全文件全部1,048,576行完成精确折行”混为一谈，下表将两种模式严格分列：
+
+1. **默认 `--smoke=startup`（首帧绘制就绪语义）**：完成首轮`window.draw(cx).clear(cx)`即记录`visible_panes_ready_ms`与尚未折行的`pending_wrap_rows_after_first_draw`并退出；
+2. **全量收敛 `EDITOR_SMOKE_AWAIT_FULL_WRAP=1`**：首帧绘制后持续以`window.refresh(); window.draw(cx).clear(cx)`推进渐进折行直到`pending_wrap_rows == 0`，记录`full_wrap_converged_ms`与全程内存/指令峰值。
+
+| 夹具形态 / 模式与版本 | 样本数 | 首帧就绪均值 / 中位数 (ms) | 全量收敛均值 / 中位数 (ms) | 场景总耗时均值 / 中位数 (ms) | 首帧后待折行行数 | 进程peak RSS 均值 / 中位数 (MiB) | peak footprint 均值 / 中位数 (MiB) | 平均退休指令数 (十亿) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `short_repeated` / `old` | 3 | 422.11 / 421.57 | —（同步全量） | 513.43 / 512.85 | — | 331.30 / 331.30 | 325.39 / 325.39 | 5.54 |
+| `short_repeated` / `new` 默认首帧 | 3 | 321.12 / 319.35 | —（未等收敛） | 413.86 / 414.42 | 1,040,385 | 355.33 / 355.23 | 352.52 / 352.52 | 3.60 |
+| `short_repeated` / `new` `AWAIT_FULL_WRAP=1` | 3 | 325.46 / 325.08 | 1689.09 / 1667.45 | 1818.37 / 1801.09 | 1,040,385 → 0 | 415.02 / 369.83（max 505.70） | 381.33 / 364.95 | 9.57 |
+| `short_unique` / `old` | 1 | 7104.93 / 7104.93 | —（同步全量） | 7201.05 / 7201.05 | — | 2324.72 / 2324.72 | 2172.24 / 2172.24 | 153.56 |
+| `short_unique` / `new` 默认首帧 | 3 | 344.53 / 344.23 | —（未等收敛） | 443.64 / 441.95 | 1,043,450 | 355.93 / 355.94 | 353.06 / 353.06 | 4.35 |
+| `short_unique` / `new` `AWAIT_FULL_WRAP=1` | 3 | 344.30 / 342.06 | 9283.03 / 9267.54 | 9395.59 / 9388.10 | 1,043,457 → 0 | 464.97 / 500.94（max 515.31） | 375.86 / 381.78 | 166.60 |
+| `long_64k` / `old` | 1 | 1137.43 / 1137.43 | —（同步全量） | 1232.13 / 1232.13 | — | 226.72 / 226.72 | 224.06 / 224.06 | 25.30 |
+| `long_64k` / `new` 默认首帧 | 1 | 1139.62 / 1139.62 | — | 1229.52 / 1229.52 | 0 | 223.61 / 223.61 | 220.83 / 220.83 | 25.33 |
+| `long_64k` / `new` `AWAIT_FULL_WRAP=1` | 1 | 1130.96 / 1130.96 | 1133.34 / 1133.34 | 1220.12 / 1220.12 | 0 → 0 | 223.59 / 223.59 | 220.83 / 220.83 | 25.30 |
+
+### 结论与测量边界
+
+- **`short_unique`首屏响应与内存双重收敛**：在百万全唯一短行下，默认`--smoke=startup`首帧就绪时间由**7.10秒（7,104.93 ms）降至344.53 ms**（-95.2%），首帧阶段进程peak RSS由**2,324.72 MiB降至355.93 MiB**（-84.7%）；在`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`驱动全部1,048,576行完成100%精确折行收敛后，全过程peak RSS仍保持在**464.97 MiB均值 / 500.94 MiB中位数**（区间378.66–515.31 MiB，相对旧版2,324.72 MiB均值下降80.0%，peak footprint由2,172.24 MiB降至375.86 MiB均值 / 381.78 MiB中位数）。
+- **诚实代价与权衡**：全唯一百万行的完整CoreText整形总量并未凭空消失（因为没有近似字形宽度），`short_unique`后台全量收敛耗时为**9.28秒**（9,283.03 ms均值，退休指令数166.60B vs 旧版同步7.10秒 / 153.56B），即将原先阻塞首帧的7.10秒同步整形拆分为344.53 ms首屏可交互 + 分帧后台渐进完成，同时利用256条`WindowTextSystem`轮换消除约1.86 GiB长期内存滞留。
+- **`short_repeated`与`long_64k`**：`short_repeated`默认首帧就绪由422.11 ms降至321.12 ms；`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`全量收敛耗时1,689.09 ms，peak RSS中位数369.83 MiB（3次样本中两次约369.5–369.8 MiB、一次峰值505.70 MiB，均远低于旧版唯一行2.27 GiB）。`long_64k`总行数1,024 ≤ 4,096，首帧即100%同步完成（`pending_wrap_rows_after_first_draw = 0`），peak RSS略降约3.1 MiB且耗时持平。
+- **样本与范围限制**：每组样本为1–3次（不推导p95），未清OS缓存（warm/unspecified），且`visible_panes_ready_ms`与`full_wrap_converged_ms`反映Metal绘制调用边界而非物理屏幕像素扫描；本轮未在Windows或Linux上采集ADR 016桌面性能对照。

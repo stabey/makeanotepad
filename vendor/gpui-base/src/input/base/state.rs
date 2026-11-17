@@ -839,6 +839,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         &self.display_map
     }
 
+    /// Number of buffer lines still awaiting exact soft-wrap measurement.
+    #[inline]
+    pub fn pending_wrap_rows(&self) -> usize {
+        self.display_map.pending_wrap_rows()
+    }
+
+    /// Release transient substring-width measurement caches held for reflow.
+    pub fn release_transient_layout_caches(&mut self) {
+        self.display_map.clear_transient_measurements();
+    }
+
     /// Wrap the text for `font`, `font_size` and `width` before the first
     /// layout, so that [`DisplayMap::wrap_row_count`] is known on the first frame.
     ///
@@ -2726,6 +2737,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         for (offset, anchor, line_end_affinity) in sources {
             let anchor = anchor.or_else(|| self.preferred_column_for(offset));
             let (target, _) = self.vertical_target(offset, anchor, line_end_affinity, move_lines);
+            let target = self.cursor_boundary(target, Bias::Left);
             if target == offset || offsets.contains(&target) {
                 continue;
             }
@@ -2751,6 +2763,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.is_multi_line() {
             return;
         }
+        let offset = self.cursor_boundary(offset, Bias::Left);
 
         for sel in self.selections.iter() {
             if sel.contains(offset) {
@@ -2800,8 +2813,8 @@ impl<M: InputModeKind> InputBaseState<M> {
                 .display_row_column_to_offset(row, start_col);
             let sel_end = self.display_map.display_row_column_to_offset(row, end_col);
             let id = self.selections.generate_id();
-            let sel_start = self.text.clip_offset(sel_start, Bias::Left);
-            let sel_end = self.text.clip_offset(sel_end, Bias::Left);
+            let sel_start = self.cursor_boundary(sel_start, Bias::Left);
+            let sel_end = self.cursor_boundary(sel_end, Bias::Left);
             new_selections.push(CursorSelection::new(id, sel_start, sel_end));
         }
 
@@ -2812,7 +2825,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Resolve a columnar point to the display row it is on and the column it reaches,
     /// counting the columns beyond the row's end so a short row keeps the full span.
     fn columnar_row_column(&self, point: ColumnarPoint) -> (usize, usize) {
-        let display_point = self.display_map.offset_to_wrap_display_point(point.offset);
+        let offset = self.cursor_boundary(point.offset, Bias::Left);
+        let display_point = self.display_map.offset_to_wrap_display_point(offset);
         let row = self
             .display_map
             .wrap_row_to_display_row(display_point.row)
@@ -12663,6 +12677,95 @@ mod tests {
                     previous.origin.x
                 );
                 assert!(range_bounds.size.width >= px(0.0));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_crlf_columnar_and_vertical_multicursor_preserve_crlf_boundaries(
+        cx: &mut TestAppContext,
+    ) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let original = "col_alpha_123\r\ncol_x\r\ncol_中文_999\r\n";
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(original, window, cx);
+                // Place caret at end of row 0 ("col_alpha_123", before \r\n).
+                state.active_selection_mut().place_at(13, None);
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Vertical AddCursorBelow onto uneven CRLF rows must clamp left of \r\n (never \r|\n).
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.add_cursor_below(&AddCursorBelow, window, cx);
+                state.add_cursor_below(&AddCursorBelow, window, cx);
+                // Explicit add_cursor_at on \r|\n offset (21) clamps to 20 and rejects duplicate.
+                state.add_cursor_at(21, cx);
+                let offsets: Vec<_> = state.selections.iter().map(|s| (s.start, s.end)).collect();
+                assert_eq!(offsets.len(), 3);
+                assert_eq!(offsets[0], (13, 13));
+                assert_eq!(offsets[1], (20, 20));
+                assert_eq!(offsets[2].0, offsets[2].1);
+                assert!((22..=36).contains(&offsets[2].0));
+
+                state.replace_text_in_range(None, "!", window, cx);
+                let after = state.value();
+                assert_eq!(after.matches("\r\n").count(), 3);
+                assert!(!after.replace("\r\n", "").contains(['\r', '\n']));
+                assert!(after.starts_with("col_alpha_123!\r\ncol_x!\r\n"));
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), original);
+            });
+        });
+
+        // Vertical AddCursorAbove onto a shorter CRLF row must also clamp left of \r\n.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("a\r\nlong_line_12345\r\n", window, cx);
+                state.active_selection_mut().place_at(18, None);
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.add_cursor_above(&AddCursorAbove, window, cx);
+                let offsets: Vec<_> = state.selections.iter().map(|s| (s.start, s.end)).collect();
+                assert_eq!(offsets, vec![(18, 18), (1, 1)]);
+            });
+        });
+
+        // Columnar selection with an endpoint inside \r|\n on short row 1 must stay before \r\n.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(original, window, cx);
+                state.build_columnar_selection(
+                    ColumnarPoint::new(4, 0),
+                    ColumnarPoint::new(21, 5),
+                    cx,
+                );
+                let ranges: Vec<_> = state.selections.iter().map(|s| (s.start, s.end)).collect();
+                assert_eq!(ranges, vec![(4, 10), (19, 20)]);
+
+                // Spanning all 3 rows across uneven CRLF + UTF-8 lines keeps every \r\n intact.
+                state.build_columnar_selection(
+                    ColumnarPoint::new(4, 0),
+                    ColumnarPoint::new(36, 0),
+                    cx,
+                );
+                let ranges: Vec<_> = state.selections.iter().map(|s| (s.start, s.end)).collect();
+                assert_eq!(ranges, vec![(4, 13), (19, 20), (26, 36)]);
+
+                state.replace_text_in_range(None, "Z", window, cx);
+                assert_eq!(state.value(), "col_Z\r\ncol_Z\r\ncol_Z\r\n");
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), original);
             });
         });
     }

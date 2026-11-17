@@ -394,6 +394,8 @@ pub fn register_bindings_and_menus(cx: &mut gpui_kit::App) {
                 OsAction::SelectAll,
             ),
             MenuItem::separator(),
+            MenuItem::action("Add Cursor Above", gpui_kit::base::input::AddCursorAbove),
+            MenuItem::action("Add Cursor Below", gpui_kit::base::input::AddCursorBelow),
             MenuItem::action("Indent Lines", gpui_kit::component::input::Indent),
             MenuItem::action("Outdent Lines", gpui_kit::component::input::Outdent),
             MenuItem::action("Duplicate Line / Active Selection", DuplicateLine),

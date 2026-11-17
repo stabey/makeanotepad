@@ -4,8 +4,8 @@
 
 ## 平台与分发
 
-- 本地原生桌面GUI验收环境目前已覆盖macOS Apple Silicon与Windows 11 ARM64（Parallels Desktop虚拟机，WDDM显卡2.0x缩放）。Windows x64裸机、Linux x64及macOS Intel仍仅具CI编译、工作区测试与无窗口`services_smoke`证据，不等于完整桌面GUI或性能基线。
-- 尚无签名、公证、安装包或自动更新交付。macOS源码构建需要Rust及完整Xcode/Metal；Windows/Linux构建依赖见CI平台准备脚本，开发ZIP不自动安装系统运行库。Windows版`editor.exe`当前为兼顾`--help`/`--version`/`--smoke`标准输出保留了控制台子系统（直接双击或独立启动时会附带控制台窗口），且状态栏路径暂未剥离Windows `canonicalize`生成的`\\?\`前缀。
+- 本地原生桌面GUI验收环境目前已覆盖macOS Apple Silicon与Windows 11 ARM64（Parallels Desktop虚拟机，WDDM显卡2.0x缩放；其中Windows桌面实跑与帧缓冲截图基于ADR 013/014构建，合入ADR 015/016后的重建产物待下一次CI与Parallels Windows运行复验）。Windows x64裸机、Linux x64及macOS Intel仍仅具CI编译、工作区测试与无窗口`services_smoke`证据，不等于完整桌面GUI或性能基线。
+- 尚无签名、公证、安装包或自动更新交付。macOS源码构建需要Rust及完整Xcode/Metal；Windows/Linux构建依赖见CI平台准备脚本，开发ZIP不自动安装系统运行库。Windows版`editor.exe`已在代码与打包校验中完成ADR 015改造（启用`windows_subsystem = "windows"`并以管道安全`AttachConsole(ATTACH_PARENT_PROCESS)`保留已有标准句柄，`package_artifact.py`强制校验`editor.exe` PE GUI子系统`0x0002`与`editor-services.exe` CUI子系统`0x0003`，同时在状态栏、Quick Switcher、`"Saved {}"`提示与恢复目录接入Fail-closed `\\?\`路径展示剥离而不改写规范`PathBuf`）；独立启动无黑框与界面路径展示的Windows桌面实机复验待下一次CI/Windows运行确认。
 - 原子安全保存支持macOS、Linux与Windows（其余未知目标显式返回`Unsupported`）。Windows 11 ARM64桌面已实测`Ctrl+Shift+S`调起原生COM `IFileSaveDialog`完成NTFS保存闭环，但尚未穷尽网络盘/UNC/UAC受限目录等所有系统文件对话框边界，真实中文输入法候选窗仍未验收，仍是未签名开发构建而非正式发行版。
 - NSH保留独立实验，不进入默认编辑器；真实IME、完整焦点/DPI/主题同步、正式SDK与插件生命周期门槛未通过。JSON扩展、LSP、图片查看器、离线扩展包尚未实现。
 
@@ -21,12 +21,12 @@
 ## 日常编辑界面
 
 - 侧栏目前管理打开文档和最近文件，不是项目目录树；跨目录搜索未实现。
-- 已实现标签组和最多8个不同文档窗格；同文档独立多视图尚未实现。上限仍为128个自定义组加未分组、1024个视图、128个已hydrate编辑器，不按窗格复制预算。窗口空间不足会暂时只显示焦点窗格，逻辑布局保留。
-- 自定义复制/删除/移动/注释只操作活动选区，会收拢其他光标；上游完整选区集合未公开。不将这些命令宣传为多光标批量编辑。
+- 已实现标签组和最多8个不同文档窗格；同文档独立多视图尚未进入主应用（`spikes/multiview-paged`保持只读隔离实验状态；主应用启用同文档多视图仍需完成`layout format v3`及统一关闭/重载/预算设计）。上限仍为128个自定义组加未分组、1024个视图、128个已hydrate编辑器，不按窗格复制预算。窗口空间不足会暂时只显示焦点窗格，逻辑布局保留。
+- 矩形/列选（`Alt+Shift`拖拽；Linux亦可`Ctrl+Alt`）与垂直多光标（`AddCursorAbove`/`AddCursorBelow`，macOS为`Cmd+Alt+↑/↓`、Windows为`Ctrl+Alt+↑/↓`、Linux为`Shift+Alt+↑/↓`，亦可经Edit菜单与命令面板调用）已修复CRLF边界（`cursor_boundary(..., Bias::Left)`），并通过原生`--smoke=usability`及私有单测；但自定义复制/删除/移动/注释（`DuplicateLine`/`DeleteLine`/`MoveLineUp`/`MoveLineDown`/`ToggleComment`）仍只操作活动选区并收拢其他光标（因`gpui-base`未公开完整`selections`集合），不将这些自定义行命令宣传为多光标批量编辑。
 - 行命令最多50,000行、4 MiB跨度/输出；只提供已知`//`、`#`、`--`行注释，不为JSON等格式插入非法注释。
 - 视图偏好写入独立于草稿恢复。已有偏好flush尚未结束时的后续写入错误，可能到下一次flush或退出才显示；错误保持可见于持久化屏障，不影响正文恢复确认。
 - 此前按应用窗口捕获失败：`screencapture -l`返回无法创建图像，ScreenCaptureKit返回`-3811`，可枚举显示器数为0；这些观察不足以确定物理显示器或锁屏根因。本轮未补像素级呈现验收。真实AppKit窗口内程序化smoke不能替代物理鼠标、系统Option键、真实IME与屏幕端到端验收；外部SIGTERM仅用于清理，不是应用正常退出确认。
-- 未修改Kit 0.9.0的unmark、空标记取消和IME Undo/Redo事件边界缺陷已有有界补丁；原始6个失败断言、实际工作区保存/关闭及SQLite重启恢复已通过。IME部分维护两个内部文件；后续普通加载/行布局优化将原生维护范围扩为三个文件，未修改应用层提交/身份屏障。真实系统输入法候选窗口、重转换及平台回调顺序仍未验收，不能从合成原生回调外推。
+- 未修改Kit 0.9.0的unmark、空标记取消和IME Undo/Redo事件边界缺陷已有有界补丁；原始6个失败断言、实际工作区保存/关闭及SQLite重启恢复已通过。受维护`vendor/gpui-base`原生源文件范围现为**6个文件**（`state.rs`、`undo_manager.rs`、`element.rs`、`display_map.rs`、`wrap_map.rs`、`text_wrapper.rs`，统一记录于`vendor/gpui-base/NOTICE-IME-PATCH.json`），覆盖IME历史/结算、Rope接管与顺序行布局、256上限`WindowTextSystem`缓存轮换、视口优先渐进折行与CRLF多光标边界修复，未修改应用层提交/身份屏障。真实系统输入法候选窗口、重转换及平台回调顺序仍未验收，不能从合成原生回调外推。
 
 ## 恢复与保存
 
@@ -42,4 +42,4 @@
 - 既有大文件/服务实验数据位于外置USB SSD，不是内置NVMe；本轮本地构建IME及纯打开对照夹具位于独立`/tmp`目录，CI产物再验收使用独立`/Volumes/macport/Caches/tmp`目录。均未清除OS缓存，标为warm/unspecified。服务读取延迟不是GUI首屏，输入提交耗时不是屏幕端到端延迟。
 - 64 GiB完整文件扫描、16文件共享缓存、100草稿惰性恢复已有服务层证据；原生主应用的最终运行状态见测试报告，不从服务测试外推。
 - Unicode键盘事件注入不替代真实中文输入法预编辑、候选窗口及组合提交验收。
-- 普通文件内存与加载延迟在缓存不利形态下仍是明确风险。ADR013后的同夹具release交替对照（67,108,860 B）中，常规重复短行平均peak RSS降至331.32 MiB、正文就绪降至434.76 ms（各3次）；但1,048,576行全唯一短行因首帧全量同步CoreText整形与宽度缓存未命中，单次对照仍需2324.94 MiB peak RSS与7.38秒正文就绪（旧版为5305.00 MiB与28.58秒）。后台未证实完成draw的记录不用于稳定内存结论；本轮仍无稳定绘制后的长期多文档堆或泄漏结论，本机ScreenCaptureKit枚举显示器为0（错误码`-3811`），外部窗口像素截图仍未验证。证据见性能报告与测试报告。
+- 普通文件内存与加载延迟在缓存不利形态下已大幅收敛但仍有清晰边界。ADR 016同夹具macOS ARM64配对release对照（67,108,860 B，warm/unspecified `/tmp`）中：1,048,576行全唯一短行（`short_unique`）在默认`--smoke=startup`下的首帧就绪时间由7.10秒（7,104.93 ms）降至**344.53 ms**、首帧peak RSS由2324.72 MiB降至**355.93 MiB**（首帧后待折行约1,043,450行）；在`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`驱动100%精确折行收敛后，总后台收敛时间仍为**9.28秒**（9,283.03 ms均值，因未近似字形宽度），但全程peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（最大515.31 MiB）。后台未证实完成draw的记录不用于稳定内存结论；本轮仍无稳定绘制后的长期多文档堆或泄漏结论，本机ScreenCaptureKit枚举显示器为0（错误码`-3811`），外部窗口像素截图仍未验证。证据见性能报告与测试报告。

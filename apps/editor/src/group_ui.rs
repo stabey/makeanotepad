@@ -2125,8 +2125,8 @@ impl EditorWorkspace {
                 let path_detail = stub
                     .meta
                     .path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
+                    .as_deref()
+                    .map(crate::shell::display_path_string)
                     .unwrap_or_else(|| "Unsaved / Untitled record".to_string());
                 let saved_size = stub
                     .meta

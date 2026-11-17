@@ -1239,6 +1239,15 @@ impl EditorAdapter {
         self.editor.update(cx, |state, cx| state.focus(window, cx));
     }
 
+    pub fn pending_wrap_rows(&self, cx: &App) -> usize {
+        self.editor.read(cx).pending_wrap_rows()
+    }
+
+    pub fn release_transient_layout_caches(&self, cx: &mut App) {
+        self.editor
+            .update(cx, |state, _| state.release_transient_layout_caches());
+    }
+
     /// Returns `(cursor_byte, 1-based line, 1-based char col)` from `committed_rope` in $O(\log N)$.
     pub fn cursor_metrics(&self, cx: &App) -> (usize, usize, usize) {
         let state = self.editor.read(cx);

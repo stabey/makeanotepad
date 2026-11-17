@@ -2,7 +2,7 @@
 
 Rust + GPUI Kit 文本编辑器。产品与验收基线见 [交接文档](Rust_GPUI_Editor_Agent_Handoff_v1.0.md)，当前状态见 [IMPLEMENTATION_STATUS](IMPLEMENTATION_STATUS.md)。默认应用与NSH候选实验隔离；本地原生桌面GUI验收目前已覆盖macOS Apple Silicon与Windows 11 ARM64（Parallels虚拟机），其余CI目标的构建与无窗口验证不等于完整桌面支持。
 
-产品定位是接近Notepad++的纯文本编辑器：本体优先保证编辑、保存恢复、大文件、多文件、标签页组及单窗口分屏。项目模型和LSP不作为本体目标；未来如需这些能力，通过插件提供。当前已实现标签页组和不同文档的单窗口分屏；同一文档的独立多视图尚未实现。
+产品定位是接近Notepad++的纯文本编辑器：本体优先保证编辑、保存恢复、大文件、多文件、标签页组及单窗口分屏。项目模型和LSP不作为本体目标；未来如需这些能力，通过插件提供。当前已实现标签页组和不同文档的单窗口分屏；同一文档的独立多视图仍未进入主应用（`spikes/multiview-paged`仅作只读隔离实验，主应用启用前需先完成`layout format v3`设计）。
 
 ## 构建环境
 
@@ -26,7 +26,7 @@ cargo test --locked --workspace
 
 在成功运行的 **Artifacts** 中下载对应目标的ZIP，保留14天。产物含`editor`/`editor.exe`、服务CLI、构建身份、SHA-256、目标相关许可证清单及许可文件。它们是开发构建，不是安装包或正式签名/公证版本；系统运行库仍由目标环境提供。
 
-原子安全保存现支持macOS、Linux与Windows（其余未知平台产物仍会携带`EXPERIMENTAL-CANNOT-SAVE.txt`）。其中macOS ARM64与Windows 11 ARM64已完成真实桌面窗口及保存闭环验收（Windows 11含原生`IFileSaveDialog`另存为与帧缓冲截图）；Windows x64裸机、Linux x64与macOS Intel目前仅完成CI测试与无窗口服务验证，且全平台真实系统输入法候选窗仍待人工验收。草稿恢复仍不能替代显式保存文件。
+原子安全保存现支持macOS、Linux与Windows（其余未知平台产物仍会携带`EXPERIMENTAL-CANNOT-SAVE.txt`）。其中macOS ARM64与Windows 11 ARM64（ADR 014构建）已完成真实桌面窗口及保存闭环验收（Windows 11含原生`IFileSaveDialog`另存为与帧缓冲截图）；Windows版GUI子系统防黑框（`windows_subsystem = "windows"` + 管道安全`AttachConsole`）及Fail-closed `\\?\`路径展示剥离已在代码与打包校验中完成（ADR 015），待下一次Windows CI及桌面运行复验。Windows x64裸机、Linux x64与macOS Intel目前仅完成CI测试与无窗口服务验证，且全平台真实系统输入法候选窗、签名/公证与安装包仍待交付或人工验收。草稿恢复仍不能替代显式保存文件。
 
 CI在五个原生目标上均运行无需窗口的`--help`、`--version`、100文档惰性会话验证及保存/故障注入服务验证（`services_smoke`）。它不执行GUI smoke，不证明真实IME、鼠标交互、GPU兼容或性能指标。具体状态以运行日志及ZIP中的`BUILD_IDENTITY.txt`、`HEADLESS_SMOKE.json`为准。
 
@@ -48,11 +48,13 @@ CI在五个原生目标上均运行无需窗口的`--help`、`--version`、100�
 | `Cmd+B` | 显示/隐藏侧栏 |
 | `Cmd+Shift+D` / `Cmd+Shift+K` | 复制行 / 删除行 |
 | `Alt+↑` / `Alt+↓` | 上移 / 下移当前行或选中行 |
+| `Cmd+Alt+↑` / `Cmd+Alt+↓` | 上下添加光标（Windows `Ctrl+Alt+↑/↓`，Linux `Shift+Alt+↑/↓`；亦可由Edit菜单或命令面板调用） |
+| `Alt+Shift+拖动` | 矩形/列块选择（Linux亦可`Ctrl+Alt+拖动`） |
 | `Cmd+/` | 支持语言的行注释切换 |
 | `Tab` / `Shift+Tab` | 原生缩进 / 取消缩进 |
 | `Alt+Z` | 自动折行 |
 
-自定义复制/删除/移动/注释命令只处理**活动选区**，会收敛其他光标；原生缩进保留Kit自身的多光标行为。单次行操作跨度/输出限制4 MiB，超限拒绝而非部分修改。JSON、纯文本、CSS、HTML、XML、Markdown不提供伪行注释。
+矩形/列选与`AddCursorAbove`/`AddCursorBelow`垂直多光标支持原生多光标编辑与单次撤销并保持`\r\n`边界完整；自定义复制/删除/移动/注释命令仍只处理**活动选区**，会收敛其他光标（因`gpui-base`未公开完整`selections`集合）；原生缩进保留Kit自身的多光标行为。单次行操作跨度/输出限制4 MiB，超限拒绝而非部分修改。JSON、纯文本、CSS、HTML、XML、Markdown不提供伪行注释。
 
 底部状态栏可选择语言、LF/CRLF、UTF-8/BOM、空格/Tab及2/4/8宽度，并切换折行、空白字符显示。语言和显示选项不修改文件；编码/换行变化会标记已保存文件为未保存，并进入恢复保护。只读/分页文档禁用不适用的写入选项。
 
@@ -119,9 +121,9 @@ IME结算、原子撤销及实际保存/关闭/重启恢复另有macOS原生场�
 target/release/editor --data-dir .smoke-data/ime-check --smoke=ime --smoke-report .smoke-data/ime-check.json
 ```
 
-本地维护`gpui-base 0.9.0`的三个源文件：IME结算/历史发布，以及普通文件加载、行布局与首次折行优化；依赖版本和应用层提交屏障不变，新增仅用于新建EditorMode的Rope接管构造器。来源和维护边界见[vendor notice](vendor/gpui-base/NOTICE-IME-PATCH.json)与ADR011–ADR013。该补丁不提供共享可编辑多视图，也不等于真实系统输入法候选窗口已验收。
+本地维护`gpui-base 0.9.0`的**六个源文件**（`state.rs`、`undo_manager.rs`、`element.rs`、`display_map.rs`、`wrap_map.rs`、`text_wrapper.rs`）：涵盖IME结算/历史发布、普通文件Rope接管与顺序行布局、256上限`WindowTextSystem`缓存轮换、视口优先渐进折行与CRLF多光标边界修复；依赖版本和应用层提交屏障不变，新增仅用于新建EditorMode的Rope接管构造器。来源和维护边界见[vendor notice](vendor/gpui-base/NOTICE-IME-PATCH.json)与ADR011–ADR013、ADR016。该补丁不提供共享可编辑多视图，也不等于真实系统输入法候选窗口已验收。
 
-同机ADR013前后的release交替对照（67,108,860 B）中：常规重复短行（各3次）平均peak RSS从455.73降至331.32 MiB（相对ADR012前690.66 MiB累计下降52.0%），正文就绪从1.42降至0.43秒；缓存不利的1,048,576行全唯一短行（各1次）peak RSS从5305.00降至2324.94 MiB，正文就绪从28.58降至7.38秒。165个工作区测试、25个私有行布局测试、11个私有IME历史测试及真实窗口回归通过。全唯一百万短行因首帧全量CoreText整形仍有较高内存与耗时，不承诺任意文本形态达到相同数字；测量边界与原始证据见[性能记录](docs/PERFORMANCE_REPORT.md)。
+同机ADR016配对release对照（67,108,860 B，warm/unspecified `/tmp`）中：缓存不利的1,048,576行全唯一短行（`short_unique`）首帧就绪时间由7.10秒（7,104.93 ms）降至**344.53 ms**、首帧peak RSS由2324.72 MiB降至**355.93 MiB**（首帧后待折行约1,043,450行），开启`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`完成100%精确折行收敛后全过程peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（后台收敛均值**9.28秒**）；常规重复短行首帧就绪由422.11降至321.12 ms。本地工作区166个测试、9个CI打包测试、27个私有行布局测试、11个私有IME历史测试、1个CRLF列选边界测试及7项原生macOS窗口回归通过；不承诺任意文本形态或冷盘达到相同数字，测量边界与原始证据见[性能记录](docs/PERFORMANCE_REPORT.md)与[测试记录](docs/TEST_REPORT.md)。
 
 ## 候选运行时
 
@@ -141,7 +143,7 @@ CARGO_TARGET_DIR="$PWD/target" cargo run --locked --release --manifest-path spik
 CARGO_TARGET_DIR="$PWD/target" cargo run --locked --release --manifest-path spikes/multiview-paged/Cargo.toml --bin multiview-paged -- --views 8 --report /tmp/multiview-paged.json
 ```
 
-普通编辑器诊断的退出码`2`表示实验完成但发现安全断言失败；受维护补丁后的实际运行为exit `0`，12个产品断言通过，包括此前失败的6项。旧`source_prediction`仅记录未修改版本的预测，不是补丁后的验收条件。分页实验以一个真实文件源挂载`1/2/4/8`个独立虚拟视口；大于4 GiB的稀疏夹具仅验证偏移正确性，不能作为吞吐成绩。可编辑共享文本、同文档视图持久化、真实输入法及像素呈现仍未交付，详见架构决策和测试记录。
+普通编辑器诊断的退出码`2`表示实验完成但发现安全断言失败；受维护补丁后的实际运行为exit `0`，12个产品断言通过，包括此前失败的6项。旧`source_prediction`仅记录未修改版本的预测，不是补丁后的验收条件。分页实验以一个真实文件源挂载`1/2/4/8`个独立虚拟视口；大于4 GiB的稀疏夹具仅验证偏移正确性，不能作为吞吐成绩。该实验保持只读隔离，主应用启用同文档多视图仍需先完成`layout format v3`设计；可编辑共享文本、真实系统IME候选窗、裸机Win x64/Linux/Mac Intel桌面GUI、签名公证/安装包及NSH（T12–T16）仍未交付或未验收，详见架构决策和测试记录。
 
 ## 证据
 

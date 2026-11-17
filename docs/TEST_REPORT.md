@@ -283,3 +283,28 @@ ADR012实现与复审无剩余阻塞；不改变IME事件/历史协议、应用�
 - **Windows NTFS服务层故障注入**：在NTFS卷上执行`editor-services.exe`的`smoke`、`session-bench 100`、`recovery-bench`（1 MiB × 10次SQLite `FULL`提交）、`crash-recovery`+`recover-check`（退出码86后恢复`durable_revision=1`）及`crash-save`全部5阶段（前3阶段保留`"original\n"`，后2阶段经`MoveFileExW`原子发布`"captured new text\n"`且0残留临时文件），全部通过，见[Windows NTFS故障报告](evidence/win11-arm64-ntfs-faults.json)。
 - **Windows实时桌面窗口、快捷键、原生COM `IFileSaveDialog`闭环与帧缓冲截图**：无`--smoke`交互启动`editor.exe`打开UTF-8含中文与Emoji的Rust源码，确认顶层`GPUI_Window`可见（`1280×820`逻辑客户区，DPI 192）并采集[实时主窗口截图](evidence/win11-editor-live-window.png)；通过系统输入发送`Ctrl+N`新建标签、粘贴文本（状态栏实时推进至`rev 37 (durable)`）、发送`Ctrl+Shift+S`调起Windows原生COM `IFileSaveDialog`（`#32770`模态`Save As`对话框）并采集[原生另存为对话框截图](evidence/win11-editor-save-dialog.png)（同时观察到向受保护`C:\`根目录保存时系统原生权限提示正常弹出）；随后输入`C:\Temp\makeanotepad_verify\dialog_roundtrip\saved_via_native_dialog.txt`回车完成保存，核实NTFS落盘字节为精确37 B且标签切换为已保存状态并进入`RECENT FILES`，采集[保存完成后截图](evidence/win11-editor-after-save.png)；最后发送`WM_CLOSE`正常退出（`exit 0`），记录见[Windows交互UI报告](evidence/win11-arm64-interactive-ui.json)。（截图已裁剪居中窗口与任务栏区域以排除无关公共桌面图标；实测观察到Windows版保留控制台子系统时独立启动会附带黑框且状态栏显示`\\?\C:\...`前缀，已记入已知限制。）
 - **虚拟机环境还原与清理**：验收结束后已删除`C:\Temp\makeanotepad_verify`全部夹具与会话目录（确认`%LOCALAPPDATA%\makeaedittool`自始至终未创建），彻底删除临时账号`editor_verify_tmp`及其用户目录，将`Winlogon`与`Passwordless\Device`注册表恢复至测试前原值，并将`Windows 11 (1)`重新挂起回`suspended`状态；宿主机`/tmp/ci_43204649933_verify`临时目录已清理。Windows x64裸机、Linux桌面GUI及真实中文输入法候选窗口仍按未验证处理。
+
+## ADR 015 + ADR 016 与 T08 多光标/列选闭环本地验证
+
+本轮合入ADR 015（Windows GUI子系统与管道安全`AttachConsole`、PE子系统打包检查、Fail-closed `\\?\`路径展示剥离）、ADR 016（256上限`WindowTextSystem`缓存轮换、视口优先渐进折行与滚动锚点补偿、非活动标签瞬时缓存释放、`smoke.rs`多帧`ArenaClearNeeded::clear`修复）以及T08矩形列选/垂直多光标CRLF边界修复与菜单/命令面板入口。全部构建与测试均在最终代码定稿之后执行，零`Cargo.lock`改动，原始汇总见[ADR 015/016本地回归报告](evidence/adr015-016-native-regressions.json)。
+
+- **格式、锁文件、构建身份与NOTICE核验**：
+  - `cargo fmt --all -- --check`通过（`cargo_fmt_check_passed = true`），`Cargo.lock`无差异（`cargo_lock_diff_empty = true`）。
+  - [`vendor/gpui-base/NOTICE-IME-PATCH.json`](../vendor/gpui-base/NOTICE-IME-PATCH.json)已同步为**6个**受维护原生源文件，磁盘`local_sha256`全部核验一致：`state.rs`（`f446e781...`）、`undo_manager.rs`（`a230ae3f...`）、`element.rs`（`039f11d5...`）、`display_map.rs`（`76dfd060...`）、`wrap_map.rs`（`3d23a3c4...`）、`text_wrapper.rs`（`028d69c3...`）。
+  - 最终release产物SHA-256：`target/release/editor`为`2d5203aea8fa7f49566a333aecaee8356d3fa8e86d630a7e9e8a54e69cb91778`，`target/release/editor-services`为`1da9a18f8803023dba3f2fa8c99f4a644dc93e02f04797cce8a95720a89877f1`（对照基线`old_adr016_editor_before`：`3d409f369905c6c2e55e319b3bfda9a4da52f88f3f8525cb1226fa68439ac2fd`）。
+- **打包单测、工作区测试与vendor私有测试**：
+  - `python3 -B -m unittest discover -s scripts/ci -p test_package_artifact.py -v`：**9/9**通过（含`test_windows_pe_subsystem_distinguishes_gui_and_cui`验证PE `OptionalHeader.Subsystem`区分`0x0002` GUI与`0x0003` CUI及截断/非法头拒绝）。
+  - `cargo test --locked --workspace`：**166/166**通过（`editor` lib 66、`editor` bin 0、`editor-services` lib 22、`editor-services` bin 0、`editor-services` `tests/services.rs`集成测试78），0失败、0警告；覆盖`strip_windows_verbatim_for_display_is_fail_closed`等全部回归。
+  - `vendor/gpui-base`私有测试（`--features test-support --lib --target aarch64-apple-darwin`）：
+    - `input::undo_manager::tests::ime_pin_`：**11/11**通过（过滤1,554）。
+    - `input::display_map::text_wrapper::`：**27/27**通过（过滤1,538；包含渐进折行与冷全量布局等价收敛、跨未折行区跳转、中途编辑与宽度变更回归）。
+    - `input::state::tests::test_crlf_columnar`：**1/1**通过（过滤1,564；`test_crlf_columnar_and_vertical_multicursor_preserve_crlf_boundaries`）。
+- **服务层与7项原生GUI回归场景（macOS ARM64）**：
+  - `editor-services smoke`通过全部6个场景（`open_bom_crlf`、`delta_recovery`、`save_temp_fault`、`atomic_save`、`cross_block_nonoverlap`、`discard_guard`）。
+  - 7项真实AppKit/Metal窗口场景全部`exit 0`、`passed = true`且观察到`shutdown_durable_ack_observed = true`：`startup`（默认空白启动`pending_wrap_rows_after_first_draw = 0`）、`full`（`atomic_batch_single_undo_verified = true`、分页搜索72处匹配、`kernel_parity_verified = true`、CRLF/BOM往返通过）、`usability`（**`columnar_multicursor_single_undo_verified = true`**）、`groups`、`splits`、`ime`（5项`ime_*_verified`全为`true`，含1/16/64 MiB−4 B各192次提交采样）以及跨进程`cross_process_startup_restart`（打开`Cargo.toml`并重启恢复：`expected_metadata_view_count = 1`、`restored_metadata_view_count = 1`、`final_tab_count = 1`、`hydrated_content_bytes = 391`）。
+  - 其中`--smoke=usability`在含`\r\n`与中文字符的不等长3行样本（`"col_alpha_123\r\ncol_x\r\ncol_中文_999\r\n"`）上，实测派发两次`AddCursorBelow`后键入真实字符，以及通过`state.range_to_bounds`定位坐标派发`Alt+Shift` `MouseDown/MouseMove/MouseUp`块选并键入文本，两次均验证单`visible_revision`原子递增、`\r\n`与UTF-8不被切分、单次`Undo`精确还原原字节且SQLite `durable_revision >= visible_revision`。
+- **两个隔离实验复验**：
+  - `spikes/shared-text-feasibility`：exit `0`，`phases_count = 66`，`product_acceptance` **12/12**，`diagnostic_boundary` **56/56**，`failed_assertions = 0`，窗口与弱引用清理无残留。
+  - `spikes/multiview-paged --views 8`：exit `0`，`passed = true`，全部**14/14** `*_verified`标志为`true`（66绘制帧、总耗时647.77 ms、关闭至零后缓存/索引归零）。
+- **过程缺陷透明记录（#21/#22/#23）**：第一轮Phase C配对基准运行中，`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`多帧渐进折行曾导致`short_unique`峰值RSS升至`1500.91 MiB`（`short_repeated`升至`759.6 MiB`），触发验证阻断并暂停；根因排查定位为`apps/editor/src/smoke.rs`在3处绘制调用（第338、360及`pump_frame`第1643行）以`let _ = window.draw(cx);`丢弃`ArenaClearNeeded`，阻止`cx.element_arena`跨帧清理。将3处全部修复为`window.draw(cx).clear(cx);`后，重建release并重跑全部Phase A–D测试与[ADR 016配对基准](evidence/adr015-016-startup-paired.json)，`short_unique`全量收敛peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（最大`515.31 MiB`）。
+- **未验证与保留边界**：上述全部ADR 015/016原生GUI与配对基准均在本地macOS Apple Silicon执行；合入ADR 015/016后的Windows二进制尚待下一次五目标CI与Parallels Windows桌面复验（验证无黑框启动、管道输出与`\\?\`显示剥离）；裸机Windows x64 / Linux x64 / macOS Intel桌面GUI、物理系统输入法候选窗、代码签名/公证/安装包、同文档主应用可编辑/分页多视图及NSH插件集成仍未交付或未验收。所有`/tmp/adr016_*`临时工作目录已清理，`.smoke-data`无新增残留。

@@ -12,7 +12,7 @@ use ropey::Rope;
 use super::fold_map::FoldMap;
 use super::folding::FoldRange;
 pub use super::text_wrapper::WrappingIndent;
-use super::text_wrapper::{LineItem, WrapDisplayPoint};
+use super::text_wrapper::{LayoutPaintSync, LineItem, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
 use super::{BufferPoint, DisplayPoint};
 use crate::input::Point as TreeSitterPoint;
@@ -271,6 +271,55 @@ impl DisplayMap {
     pub fn set_text(&mut self, text: &Rope, cx: &mut App) {
         self.wrap_map.set_text(text, cx);
         self.rebuild_fold_projection();
+    }
+
+    /// Number of buffer lines still awaiting exact soft-wrap measurement.
+    #[inline]
+    pub fn pending_wrap_rows(&self) -> usize {
+        self.wrap_map.pending_wrap_rows()
+    }
+
+    /// Release transient substring-width measurement caches held for reflow.
+    pub fn clear_transient_measurements(&mut self) {
+        self.wrap_map.clear_transient_measurements();
+    }
+
+    /// Synchronously wrap any deferred rows within `row_range`.
+    pub(crate) fn ensure_rows_wrapped(&mut self, row_range: Range<usize>, cx: &mut App) -> bool {
+        let wrapped = self.wrap_map.ensure_rows_wrapped(row_range, cx);
+        if wrapped {
+            self.rebuild_fold_projection();
+        }
+        wrapped
+    }
+
+    /// Synchronize layout configuration for painting and advance progressive wrapping.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sync_layout_for_paint(
+        &mut self,
+        text: &Rope,
+        font: Font,
+        font_size: Pixels,
+        tab_size: usize,
+        wrapping_indent: WrappingIndent,
+        wrap_width: Option<Pixels>,
+        priority_row: usize,
+        cx: &mut App,
+    ) -> LayoutPaintSync {
+        let result = self.wrap_map.sync_layout_for_paint(
+            text,
+            font,
+            font_size,
+            tab_size,
+            wrapping_indent,
+            wrap_width,
+            priority_row,
+            cx,
+        );
+        if result != LayoutPaintSync::Unchanged {
+            self.rebuild_fold_projection();
+        }
+        result
     }
 
     // ==================== Internal Helpers ====================

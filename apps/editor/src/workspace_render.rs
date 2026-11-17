@@ -48,7 +48,7 @@ use crate::paged_view::{PagedTabState, format_bytes};
 use crate::search_bar::{SearchQueryKind, SearchStatus};
 use crate::shell::{
     PaletteCommandTarget, PaletteMode, disambiguate_paths, disambiguate_single_path_iter,
-    file_name_str, matches_palette_filter, parse_palette_query,
+    display_path_string, file_name_str, matches_palette_filter, parse_palette_query,
 };
 impl Render for EditorWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3607,11 +3607,11 @@ impl EditorWorkspace {
                     };
                     let title = slot.title();
                     let hint = tab_hints.get(ix).map(String::as_str).unwrap_or("");
-                    let path_str = slot
+                    let (raw_path_str, disp_path_str) = slot
                         .meta()
                         .path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
+                        .as_deref()
+                        .map(|p| (p.to_string_lossy().into_owned(), display_path_string(p)))
                         .unwrap_or_default();
                     let badge = slot.honest_badge();
                     let suffix = if badge.proven_modified {
@@ -3660,7 +3660,11 @@ impl EditorWorkspace {
                     } else {
                         format!("{title} — {hint}{suffix}{grp_suffix}{pane_sfx}")
                     };
-                    if matches_palette_filter(filter, &label, &[&path_str, &grp_kw]) {
+                    if matches_palette_filter(
+                        filter,
+                        &label,
+                        &[&disp_path_str, &raw_path_str, &grp_kw],
+                    ) {
                         open_group = open_group.item(
                             CommandItem::new()
                                 .label(label)
@@ -3694,13 +3698,14 @@ impl EditorWorkspace {
                     }
                     let name = file_name_str(path);
                     let hint = recent_hints.get(ix).map(String::as_str).unwrap_or("");
-                    let full_str = path.to_string_lossy().into_owned();
+                    let raw_str = path.to_string_lossy().into_owned();
+                    let disp_str = display_path_string(path);
                     let label = if hint.is_empty() {
                         name
                     } else {
                         format!("{name} — {hint}")
                     };
-                    if matches_palette_filter(filter, &label, &[&full_str]) {
+                    if matches_palette_filter(filter, &label, &[&disp_str, &raw_str]) {
                         recent_group = recent_group.item(CommandItem::new().label(label));
                         recent_targets.push(PaletteCommandTarget::OpenRecentPath(path.clone()));
                     }
@@ -3772,6 +3777,30 @@ impl EditorWorkspace {
                     false,
                     active_ed.is_none(),
                     PaletteCommandTarget::EditSelectAll,
+                );
+                #[cfg(target_os = "macos")]
+                let (add_cursor_above_hint, add_cursor_below_hint) = ("⌥⌘↑", "⌥⌘↓");
+                #[cfg(target_os = "windows")]
+                let (add_cursor_above_hint, add_cursor_below_hint) = ("Ctrl+Alt+↑", "Ctrl+Alt+↓");
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                let (add_cursor_above_hint, add_cursor_below_hint) = ("Shift+Alt+↑", "Shift+Alt+↓");
+                push_cmd(
+                    &mut edit_group,
+                    &mut edit_targets,
+                    format!("Selection: Add Cursor Above  ({add_cursor_above_hint})"),
+                    &["cursor", "multi-cursor", "column", "above"],
+                    false,
+                    !can_edit,
+                    PaletteCommandTarget::AddCursorAbove,
+                );
+                push_cmd(
+                    &mut edit_group,
+                    &mut edit_targets,
+                    format!("Selection: Add Cursor Below  ({add_cursor_below_hint})"),
+                    &["cursor", "multi-cursor", "column", "below"],
+                    false,
+                    !can_edit,
+                    PaletteCommandTarget::AddCursorBelow,
                 );
                 push_cmd(
                     &mut edit_group,
@@ -4749,8 +4778,8 @@ impl EditorWorkspace {
                     let path_txt = ed
                         .meta
                         .path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
+                        .as_deref()
+                        .map(display_path_string)
                         .unwrap_or_else(|| "Unsaved Draft".to_string());
                     let dur_txt = if ed.durable_revision >= ed.visible_revision {
                         format!("rev {} (durable)", ed.visible_revision.0)
@@ -4788,8 +4817,8 @@ impl EditorWorkspace {
                         "PAGED",
                         pv.meta
                             .path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
+                            .as_deref()
+                            .map(display_path_string)
                             .unwrap_or_default(),
                         format!("gen {}", pv.source_gen.0),
                         format!(

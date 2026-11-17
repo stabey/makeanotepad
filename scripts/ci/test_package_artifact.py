@@ -65,6 +65,50 @@ class PackagingTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     machine_header(path, "aarch64-pc-windows-msvc")
 
+    def test_windows_pe_subsystem_distinguishes_gui_and_cui(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "binary.exe"
+            for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+                machine = 0xAA64 if target.startswith("aarch64") else 0x8664
+                for subsystem in (2, 3):
+                    with self.subTest(target=target, subsystem=subsystem):
+                        pe_offset = 64
+                        image = bytearray(pe_offset + 94)
+                        image[:2] = b"MZ"
+                        struct.pack_into("<I", image, 60, pe_offset)
+                        image[pe_offset : pe_offset + 4] = b"PE\0\0"
+                        struct.pack_into("<H", image, pe_offset + 4, machine)
+                        struct.pack_into("<H", image, pe_offset + 20, 112)
+                        struct.pack_into("<H", image, pe_offset + 24, 0x020B)
+                        struct.pack_into("<H", image, pe_offset + 24 + 68, subsystem)
+                        path.write_bytes(image)
+
+                        desc = machine_header(path, target, expected_win_subsystem=subsystem)
+                        self.assertIn(f"Subsystem=0x{subsystem:04x}", desc)
+
+                        wrong_subsystem = 3 if subsystem == 2 else 2
+                        with self.assertRaises(RuntimeError):
+                            machine_header(path, target, expected_win_subsystem=wrong_subsystem)
+
+                        # Truncated byte length before OptionalHeader.Subsystem.
+                        path.write_bytes(image[: pe_offset + 93])
+                        with self.assertRaises(RuntimeError):
+                            machine_header(path, target, expected_win_subsystem=subsystem)
+
+                        # OptionalHeaderSize smaller than required 70 bytes.
+                        too_small_opt = bytearray(image)
+                        struct.pack_into("<H", too_small_opt, pe_offset + 20, 68)
+                        path.write_bytes(too_small_opt)
+                        with self.assertRaises(RuntimeError):
+                            machine_header(path, target, expected_win_subsystem=subsystem)
+
+                        # Invalid OptionalHeader magic.
+                        bad_magic = bytearray(image)
+                        struct.pack_into("<H", bad_magic, pe_offset + 24, 0x0000)
+                        path.write_bytes(bad_magic)
+                        with self.assertRaises(RuntimeError):
+                            machine_header(path, target, expected_win_subsystem=subsystem)
+
     def test_platform_inventory_walks_resolve_not_the_packages_array(self):
         packages = [
             {"id": name, "name": name, "version": "1.0.0"}

@@ -10,7 +10,9 @@ use gpui::{App, Font, Pixels};
 use ropey::Rope;
 
 use super::fold_map::FoldMap;
-use super::text_wrapper::{LineItem, TextWrapper, WrapDisplayPoint, WrappingIndent};
+use super::text_wrapper::{
+    LayoutPaintSync, LineItem, TextWrapper, WrapDisplayPoint, WrappingIndent,
+};
 use super::{BufferPoint, WrapPoint};
 use crate::input::RopeExt;
 
@@ -39,6 +41,53 @@ impl WrapMap {
     #[inline]
     pub(super) fn buffer_line_count(&self) -> usize {
         self.wrapper.lines_count()
+    }
+
+    /// Number of buffer lines still awaiting exact soft-wrap measurement.
+    #[inline]
+    pub(super) fn pending_wrap_rows(&self) -> usize {
+        self.wrapper.pending_wrap_rows()
+    }
+
+    /// Release transient substring-width measurement caches held for reflow.
+    pub(super) fn clear_transient_measurements(&mut self) {
+        self.wrapper.clear_transient_measurements();
+    }
+
+    /// Synchronously wrap any deferred rows within `row_range`.
+    pub(super) fn ensure_rows_wrapped(&mut self, row_range: Range<usize>, cx: &mut App) -> bool {
+        self.wrapper.ensure_rows_wrapped(row_range, cx)
+    }
+
+    /// Wrap the next chunk of deferred rows up to `max_rows` and the frame budget.
+    #[allow(dead_code)]
+    pub(super) fn step_progressive_wrap(&mut self, max_rows: usize, cx: &mut App) -> bool {
+        self.wrapper.step_progressive_wrap(max_rows, cx)
+    }
+
+    /// Synchronize layout configuration for painting and advance progressive wrapping.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sync_layout_for_paint(
+        &mut self,
+        text: &Rope,
+        font: Font,
+        font_size: Pixels,
+        tab_size: usize,
+        wrapping_indent: WrappingIndent,
+        wrap_width: Option<Pixels>,
+        priority_row: usize,
+        cx: &mut App,
+    ) -> LayoutPaintSync {
+        self.wrapper.sync_layout_for_paint(
+            text,
+            font,
+            font_size,
+            tab_size,
+            wrapping_indent,
+            wrap_width,
+            priority_row,
+            cx,
+        )
     }
 
     /// Convert buffer position to wrap position

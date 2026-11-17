@@ -22,7 +22,7 @@ NOTICE_PREFIXES = (
 )
 
 
-def machine_header(path, target):
+def machine_header(path, target, expected_win_subsystem=None):
     """Check the encoded machine, not cryptographic proof of native execution."""
     with path.open("rb") as binary:
         header = binary.read(64)
@@ -42,10 +42,26 @@ def machine_header(path, target):
             if offset < 64:
                 raise RuntimeError(f"Invalid PE header offset: {path}")
             binary.seek(offset)
-            pe = binary.read(6)
+            pe_read_len = 94 if expected_win_subsystem is not None else 6
+            pe = binary.read(pe_read_len)
             machine = 0xAA64 if target.startswith("aarch64") else 0x8664
-            if len(pe) != 6 or pe[:4] != b"PE\0\0" or struct.unpack_from("<H", pe, 4)[0] != machine:
+            if len(pe) < 6 or pe[:4] != b"PE\0\0" or struct.unpack_from("<H", pe, 4)[0] != machine:
                 raise RuntimeError(f"Wrong PE machine header for {target}: {path}")
+            if expected_win_subsystem is not None:
+                if len(pe) < 94:
+                    raise RuntimeError(f"Truncated PE optional header for {target}: {path}")
+                opt_size = struct.unpack_from("<H", pe, 20)[0]
+                opt_magic = struct.unpack_from("<H", pe, 24)[0]
+                if opt_size < 70 or opt_magic not in (0x010B, 0x020B):
+                    raise RuntimeError(
+                        f"Unsupported or truncated PE optional header for {target}: {path}"
+                    )
+                subsystem = struct.unpack_from("<H", pe, 24 + 68)[0]
+                if subsystem != expected_win_subsystem:
+                    raise RuntimeError(
+                        f"Wrong PE subsystem 0x{subsystem:04x} (expected 0x{expected_win_subsystem:04x}) for {target}: {path}"
+                    )
+                return f"PE Machine=0x{machine:04x} Subsystem=0x{subsystem:04x}"
             return f"PE Machine=0x{machine:04x}"
         if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
             raise RuntimeError(f"Wrong ELF64 little-endian x86_64 machine header: {path}")
@@ -184,7 +200,14 @@ def main():
     print(f"free_disk_bytes_before_packaging={shutil.disk_usage(ROOT).free}", flush=True)
     rustc = rust_identity(args.target)
     binaries = binary_paths(args.target)
-    machines = {name: machine_header(path, args.target) for name, path in binaries.items()}
+    machines = {
+        name: machine_header(
+            path,
+            args.target,
+            expected_win_subsystem=((2 if name == "editor" else 3) if "windows" in args.target else None),
+        )
+        for name, path in binaries.items()
+    }
     hashes = {name: sha256(path) for name, path in binaries.items()}
     smoke = json.loads(args.smoke_report.read_text(encoding="utf-8"))
     if (

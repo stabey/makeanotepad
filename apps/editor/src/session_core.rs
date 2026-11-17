@@ -789,6 +789,14 @@ impl EditorWorkspace {
             if let Some(old) = old {
                 self.capture_view(old.view_id, cx);
                 self.flush_document_commit(old.document.doc_id);
+                if !self
+                    .visible_targets()
+                    .any(|t| t.document.doc_id == old.document.doc_id)
+                {
+                    if let Some(TabSlot::Editable(ed)) = self.documents.get(&old.document.doc_id) {
+                        ed.release_transient_layout_caches(cx);
+                    }
+                }
             }
             self.clear_target_highlights(old, cx);
             self.clear_target_highlights(self.search.target_view, cx);
@@ -2169,7 +2177,7 @@ impl EditorWorkspace {
                             }
                             if let Some((c,rope))=check{this.spawn_savepoint_verification(target,c.seq,c.checked_text_seq,c.saved_identity,rope,cx);}
                             this.mark_metadata(target.document.doc_id,PendingDocChangeKind::Update);this.record_recent_file(path.clone(),window,cx);
-                            this.status_flash=Some((format!("Saved {}",path.display()),Instant::now()));
+                            this.status_flash=Some((format!("Saved {}",crate::shell::display_path_string(&path)),Instant::now()));
                             if !saved{this.notify_error(failure(ErrorKind::Storage,"File saved, but recovery metadata was not acknowledged; close cancelled"),window,cx);}
                         }
                         SaveOutcome::ConflictDetected {..}=>{

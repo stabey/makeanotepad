@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -350,15 +351,110 @@ where
     comps[comps.len() - take..].join("/")
 }
 
+fn is_reserved_dos_device_stem(stem: &str) -> bool {
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+    {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && (b'1'..=b'9').contains(&bytes[3])
+}
+
+fn is_safe_win32_display_component(component: &str) -> bool {
+    if component.is_empty() || component == "." || component == ".." {
+        return false;
+    }
+    if component.ends_with(' ') || component.ends_with('.') {
+        return false;
+    }
+    let stem = component.split(['.', ':']).next().unwrap_or(component);
+    !is_reserved_dos_device_stem(stem)
+}
+
+/// Fail-closed display stripping for Windows verbatim prefixes (`\\?\` and `\\?\UNC\`).
+///
+/// Never mutates canonical `PathBuf`s; strips only when the result is an unambiguous standard
+/// Win32 path without `.`/`..`, trailing spaces/dots, forward slashes, empty segments, or
+/// reserved DOS device names.
+pub fn strip_windows_verbatim_for_display(raw: &str) -> Cow<'_, str> {
+    let Some(after_prefix) = raw.strip_prefix(r"\\?\") else {
+        return Cow::Borrowed(raw);
+    };
+
+    if after_prefix.len() >= 4 && after_prefix[..4].eq_ignore_ascii_case(r"UNC\") {
+        let rest = &after_prefix[4..];
+        if rest.is_empty() || rest.contains('/') || rest.starts_with('\\') || rest.contains("\\\\")
+        {
+            return Cow::Borrowed(raw);
+        }
+        let mut parts = rest.split('\\');
+        let Some(server) = parts.next().filter(|s| !s.is_empty()) else {
+            return Cow::Borrowed(raw);
+        };
+        let Some(share) = parts.next().filter(|s| !s.is_empty()) else {
+            return Cow::Borrowed(raw);
+        };
+        if matches!(server, "." | ".." | "?") || matches!(share, "." | "..") {
+            return Cow::Borrowed(raw);
+        }
+        if parts
+            .filter(|c| !c.is_empty())
+            .all(is_safe_win32_display_component)
+        {
+            return Cow::Owned(format!(r"\\{rest}"));
+        }
+        return Cow::Borrowed(raw);
+    }
+
+    let bytes = after_prefix.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        if bytes.len() == 2 {
+            return Cow::Borrowed(after_prefix);
+        }
+        if bytes[2] == b'\\' {
+            let tail = &after_prefix[3..];
+            if !tail.contains('/')
+                && !tail.starts_with('\\')
+                && !tail.contains("\\\\")
+                && tail
+                    .split('\\')
+                    .filter(|c| !c.is_empty())
+                    .all(is_safe_win32_display_component)
+            {
+                return Cow::Borrowed(after_prefix);
+            }
+        }
+    }
+
+    Cow::Borrowed(raw)
+}
+
+pub fn display_path_string(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    strip_windows_verbatim_for_display(raw.as_ref()).into_owned()
+}
+
 pub fn file_name_str(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| display_path_string(path))
 }
 
 fn parent_components(path: &Path) -> Vec<String> {
-    let Some(parent) = path.parent() else {
+    let raw = path.to_string_lossy();
+    let stripped = strip_windows_verbatim_for_display(raw.as_ref());
+    let target_path: Cow<'_, Path> = if stripped.as_ref() != raw.as_ref() {
+        Cow::Owned(PathBuf::from(stripped.into_owned()))
+    } else {
+        Cow::Borrowed(path)
+    };
+    let Some(parent) = target_path.parent() else {
         return Vec::new();
     };
     parent
@@ -441,6 +537,8 @@ pub enum PaletteCommandTarget {
     EditUndo,
     EditRedo,
     EditSelectAll,
+    AddCursorAbove,
+    AddCursorBelow,
     IndentSelection,
     OutdentSelection,
     DuplicateLine,
@@ -614,5 +712,119 @@ mod tests {
         let dirty_badge = describe_unhydrated_stub_badge(&bom_dirty, true);
         assert!(dirty_badge.proven_modified);
         assert_eq!(dirty_badge.short_badge, Some("MOD"));
+    }
+
+    #[test]
+    fn strip_windows_verbatim_for_display_is_fail_closed() {
+        assert!(matches!(
+            strip_windows_verbatim_for_display(r"\\?\C:\Users\dev\main.rs"),
+            Cow::Borrowed(r"C:\Users\dev\main.rs")
+        ));
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\c:\file.rs"),
+            r"c:\file.rs"
+        );
+        assert_eq!(strip_windows_verbatim_for_display(r"\\?\C:\"), r"C:\");
+        assert_eq!(strip_windows_verbatim_for_display(r"\\?\C:"), r"C:");
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\C:\dir\console.rs"),
+            r"C:\dir\console.rs"
+        );
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\C:\dir\COM10.txt"),
+            r"C:\dir\COM10.txt"
+        );
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\C:\dir\LPT0.txt"),
+            r"C:\dir\LPT0.txt"
+        );
+
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\UNC\fileserver\repo\src\lib.rs"),
+            r"\\fileserver\repo\src\lib.rs"
+        );
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\unc\fileserver\repo"),
+            r"\\fileserver\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_for_display(r"\\?\UNC\fileserver\repo\"),
+            r"\\fileserver\repo\"
+        );
+
+        // Unsafe / ambiguous / non-verbatim forms must remain untouched.
+        for unchanged in [
+            r"\\?\Volume{12345678-1234-1234-1234-1234567890ab}\file.txt",
+            r"\\.\pipe\editor-ipc",
+            r"\\?\C:relative.txt",
+            r"\\?\C:/slash/file.txt",
+            r"\\?\C:\dir/slash.txt",
+            r"\\?\C:\\dir\file.txt",
+            r"\\?\C:\dir\\file.txt",
+            r"\\?\C:\dir\.\file.txt",
+            r"\\?\C:\dir\..\file.txt",
+            r"\\?\C:\dir \file.txt",
+            r"\\?\C:\dir.\file.txt",
+            r"\\?\C:\dir\file.txt ",
+            r"\\?\C:\dir\file.",
+            r"\\?\C:\dir\CON",
+            r"\\?\C:\dir\con.txt",
+            r"\\?\C:\dir\PRN.log",
+            r"\\?\C:\dir\aux",
+            r"\\?\C:\dir\NUL.json",
+            r"\\?\C:\dir\COM1",
+            r"\\?\C:\dir\com9.bin",
+            r"\\?\C:\dir\LPT1.txt",
+            r"\\?\C:\dir\lpt9",
+            r"\\?\UNC\fileserver",
+            r"\\?\UNC\fileserver\",
+            r"\\?\UNC\\share\file.txt",
+            r"\\?\UNC\.\pipe\foo",
+            r"\\?\UNC\fileserver\share\dir/file.txt",
+            r"\\?\UNC\fileserver\share\dir\\file.txt",
+            r"\\?\UNC\fileserver\share\NUL.txt",
+            r"\\?\UNC\fileserver\share\..\file.txt",
+            r"\\?\UNC\fileserver\share\dir.\file.txt",
+            "/Users/alice/src/main.rs",
+            "relative/path.rs",
+            r"C:\already\standard.rs",
+        ] {
+            assert_eq!(
+                strip_windows_verbatim_for_display(unchanged),
+                unchanged,
+                "expected fail-closed preservation for {unchanged}"
+            );
+            assert_eq!(display_path_string(Path::new(unchanged)), unchanged);
+        }
+
+        assert_eq!(
+            display_path_string(Path::new(r"\\?\C:\Users\dev\main.rs")),
+            r"C:\Users\dev\main.rs"
+        );
+        assert_eq!(
+            display_path_string(Path::new(r"\\?\UNC\fileserver\repo\src\lib.rs")),
+            r"\\fileserver\repo\src\lib.rs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_prefixes_do_not_leak_in_file_name_or_disambiguation() {
+        assert_eq!(file_name_str(Path::new(r"\\?\C:\")), r"C:\");
+        assert_eq!(
+            file_name_str(Path::new(r"\\?\UNC\fileserver\share")),
+            r"\\fileserver\share"
+        );
+        let p1 = Path::new(r"\\?\C:\alpha\src\mod.rs");
+        let p2 = Path::new(r"\\?\UNC\fileserver\share\beta\src\mod.rs");
+        let p3 = Path::new(r"\\?\C:\alpha\Cargo.toml");
+        let labels = disambiguate_paths(&[Some(p1), Some(p2), Some(p3)]);
+        assert_eq!(labels[0], "alpha/src");
+        assert_eq!(labels[1], "beta/src");
+        assert_eq!(labels[2], "alpha");
+        for label in &labels {
+            assert!(!label.contains(r"\\?\"));
+            assert!(!label.contains("UNC"));
+        }
     }
 }

@@ -15,20 +15,20 @@
 - macOS Apple Silicon，Mac16,10，32 GiB 内存。
 - Rust/Cargo 1.99.1；Xcode 路径 `/Applications/Xcode.app/Contents/Developer`。
 - 工作卷可用空间约 1.4 TiB（实施开始时）。
-- Parallels Windows 11为ARM64（验收完成后已恢复`suspended`状态），不作为Windows x64裸机性能基线，但本轮已完成真实Windows 11 ARM64桌面GUI、快捷键、原生`IFileSaveDialog`另存为闭环、NTFS 5阶段崩溃保存及虚拟机帧缓冲截图验收。Windows x64、Linux x64与macOS Intel已通过GitHub原生CI编译、测试、原子保存与进程故障门禁，但尚未完成这些平台的桌面GUI与性能验收。
+- Parallels Windows 11为ARM64（验收完成后已恢复`suspended`状态），不作为Windows x64裸机性能基线；此前基于ADR 013/014构建已完成真实Windows 11 ARM64桌面GUI、快捷键、原生`IFileSaveDialog`另存为闭环、NTFS 5阶段崩溃保存及虚拟机帧缓冲截图验收（合入ADR 015/016后的重建二进制待下一次CI与Parallels桌面复验）。Windows x64、Linux x64与macOS Intel已通过ADR 014阶段的GitHub原生CI编译、测试、原子保存与进程故障门禁，但尚未完成这些平台的桌面GUI与性能验收。
 - 用户提及的 `edtor-review` 不在已安装 agent 列表；本次由项目指定 `design-review` 承担独立设计讨论，未假称联系到不存在的 agent。
 
 ## 当前交付
 
-- 默认原生应用`target/release/editor`可在本机运行；Kit-only、无NSH默认依赖。本轮首次折行优化（ADR013）与跨平台安全保存（ADR014）通过165个工作区测试、25个vendor行布局私有测试、11个vendor IME历史私有测试、8个CI打包脚本单元测试及release构建；本机7项原生窗口场景（`startup`、`full`、`ime`、`usability`、`groups`、`splits`及跨进程`recovery_restart`）、服务层5阶段保存崩溃注入、恢复崩溃注入与两个隔离实验全部通过，正常退出均观察到durable ACK。
-- 公开仓库为[stabey/makeanotepad](https://github.com/stabey/makeanotepad)。合入ADR013/ADR014的提交`9a32ba8`在[五目标原生CI（43204649933）](https://github.com/stabey/makeanotepad/actions/runs/43204649933)全部6个job一次通过（含全平台`services_smoke`原子保存与故障验证、Mac ARM 25个行布局私有测试与11个IME历史私有测试，5份开发ZIP均不再携带`EXPERIMENTAL-CANNOT-SAVE.txt`）。下载并校验SHA-256后，Mac ARM产物复验`--smoke=ime`通过，Windows ARM64产物在Parallels Windows 11桌面完成全部7项原生窗口回归、NTFS 5阶段保存崩溃注入、原生`Save As`系统对话框保存闭环及帧缓冲截图取证。
+- 默认原生应用`target/release/editor`可在本机运行；Kit-only、无NSH默认依赖。最新ADR 015（Windows GUI子系统/管道安全`AttachConsole`/PE子系统打包校验/Fail-closed `\\?\`路径展示剥离）、ADR 016（256上限`WindowTextSystem`缓存轮换、视口优先渐进折行与滚动锚点补偿、非活动标签瞬时缓存释放）与T08矩形列选/垂直多光标CRLF边界修复在macOS ARM64本地通过：`cargo fmt --all -- --check`、`test_package_artifact.py` 9/9、`cargo test --locked --workspace` 166/166（66+22+78）、`vendor/gpui-base`私有测试（`ime_pin_` 11/11、`text_wrapper::` 27/27、`test_crlf_columnar` 1/1）、`editor-services smoke`（6场景）、7项原生窗口回归（含`usability` `columnar_multicursor_single_undo_verified=true`与跨进程重启）以及两个隔离实验（`shared-text-feasibility` 12/12、`multiview-paged --views 8` 14/14），正常退出均观察到durable ACK。
+- 公开仓库为[stabey/makeanotepad](https://github.com/stabey/makeanotepad)。此前合入ADR013/ADR014的提交`9a32ba8`在[五目标原生CI（43204649933）](https://github.com/stabey/makeanotepad/actions/runs/43204649933)全部6个job一次通过（含全平台`services_smoke`原子保存与故障验证、Mac ARM 25个行布局私有测试与11个IME历史私有测试，5份开发ZIP均不再携带`EXPERIMENTAL-CANNOT-SAVE.txt`），并完成Mac ARM与Windows 11 ARM64桌面实跑；合入ADR 015/016后的五目标CI与Windows桌面复验尚待下一次触发。
 - 普通文档：唯一EditorState权威、版本化原子编辑、同步程序化提交与原生事件匹配、NoOp、后台普通搜索/替换、高亮、主题、保存与草稿恢复。格式仅元数据修改也进入dirty/恢复保护，保存期间再改格式不会被旧保存确认抹掉。
-- 日常界面：默认打开文档/最近文件侧栏、命令面板、快速切换、语言/编码/换行/缩进选择、折行与空白显示、活动选区行编辑/注释、偏好持久化。自定义行命令不是全多光标操作，侧栏不是项目目录树。
-- 标签组与不同文档分屏：最多8窗格，四方向拆分、标签跨窗格拖放、尺寸调整/均分、焦点切换、关闭合并、仅显示焦点窗格与重启恢复已实现。关闭窗格不关闭文档；关闭窗格内标签另走草稿保护确认。真实窗口内事件覆盖取消/保留、输入/撤销/保存隔离及空窗格恢复，不等同物理HID或像素呈现验收。同文档独立多视图尚未实现。
+- 日常界面：默认打开文档/最近文件侧栏、命令面板、快速切换、语言/编码/换行/缩进选择、折行与空白显示、矩形列选（`Alt+Shift`拖拽；Linux亦可`Ctrl+Alt`）与垂直多光标（`AddCursorAbove`/`AddCursorBelow`经快捷键、Edit菜单及命令面板调用，CRLF边界已验证）、活动选区行编辑/注释、偏好持久化。自定义行命令仍只作用于活动选区，侧栏不是项目目录树。
+- 标签组与不同文档分屏：最多8窗格，四方向拆分、标签跨窗格拖放、尺寸调整/均分、焦点切换、关闭合并、仅显示焦点窗格与重启恢复已实现。关闭窗格不关闭文档；关闭窗格内标签另走草稿保护确认。真实窗口内事件覆盖取消/保留、输入/撤销/保存隔离及空窗格恢复，不等同物理HID或像素呈现验收。同文档独立多视图尚未进入主应用（`spikes/multiview-paged`保持只读隔离实验，主应用启用前需先完成`layout format v3`设计）。
 - 大文件：有界ReadAt、共享页缓存、稀疏索引、虚拟化视图、长行分段、64位字节导航、可取消流式搜索。1/10/64 GiB非稀疏日志及长行/密集行已实测，64 GiB在真实窗口显示。
 - 多文件：16文件并发索引与共享缓存实验；分屏交付时100/1024标签×1/2/4/8窗格恢复均只加载可见文档，1024标签8窗格正文占用557,056 bytes；预算限制1个编辑器时优先焦点窗格，不按窗格复制预算。已有1000草稿整组取消/保留关闭验证保留。数字和严格测量边界见 `docs/PERFORMANCE_REPORT.md`，本轮未重跑该矩阵。
-- 同文档多视图的固定Kit公开API门槛仍为NO-GO，不采用双缓冲同步。单编辑器组合输入结算及Undo/Redo中间事件问题已通过两文件有界补丁修复；原始6个失败断言转为通过，实际Save/Close/Recovery也已运行。共享分页源实验与共享可编辑视图不是同一能力，见ADR009、ADR011及测试报告。
-- 普通加载与首次折行：ADR012实现新EditorMode直接接管Rope与顺序行遍历（短行平均peak RSS从690.66降至456.16 MiB、正文就绪从2.33降至1.43秒）；本轮ADR013进一步消除全量重排双SumTree重叠并加入单行容纳快路径与`WrapScratch`缓冲复用。同机67,108,860 B交替对照中，常规重复短行（各3次）平均peak RSS从455.73再降至331.32 MiB（-27.3%）、正文就绪从1416.78降至434.76 ms（-69.3%）、总耗时从1512.57降至526.49 ms（-65.2%）、退休指令数下降82.2%；缓存不利的1,048,576行全唯一短行（各1次）peak RSS从5305.00降至2324.94 MiB（-56.2%）、正文就绪从28.58降至7.38秒（-74.2%）；64 KiB长行保持持平（226.31 MiB / 1.22秒）。全唯一百万短行因首帧全量同步CoreText整形仍占约2.27 GiB，尚未改为视口优先/分块渐进折行。
+- 同文档多视图的固定Kit公开API门槛仍为NO-GO，不采用双缓冲同步。受维护`vendor/gpui-base`原生补丁已扩展至**6个文件**（`state.rs`、`undo_manager.rs`、`element.rs`、`display_map.rs`、`wrap_map.rs`、`text_wrapper.rs`），在保留单编辑器IME结算与历史修复（`shared-text-feasibility` 12/12）基础上追加渐进折行与CRLF多光标边界修复；共享分页源实验与共享可编辑视图不是同一能力，见ADR009、ADR011、ADR016及测试报告。
+- 普通加载、首次折行与渐进折行收敛：ADR012（接管Rope与顺序行布局）与ADR013（消除双SumTree重叠、单行容纳快路径、`WrapScratch`复用）之后，本轮ADR016通过256上限`WindowTextSystem`缓存轮换与视口优先渐进折行收敛百万唯一短行首帧阻塞与内存峰值。同机67,108,860 B配对release对照（warm/unspecified `/tmp`）中：`short_unique`默认`--smoke=startup`首帧就绪由7.10秒（7,104.93 ms）降至**344.53 ms**、首帧peak RSS由2324.72 MiB降至**355.93 MiB**（待折行约1,043,450行）；在`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`完成全部1,048,576行100%精确折行收敛后，全过程peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（区间378.66–515.31 MiB，后台收敛均值**9.28秒**）；`short_repeated`首帧就绪由422.11降至321.12 ms（全量收敛1,689.09 ms / 415.02 MiB均值）；`long_64k`首帧同步完成（223.61 MiB / 1.14秒）。
 - NSH候选已实际构建运行并保留截图，但需要上游兼容补丁，真实IME、主题同步、完整SDK等门槛未通过。决定**暂缓进入默认主线**，不是将插件系统记为完成。
 - 元数据排序及面板焦点问题已有修复与复审，失败过程和运行证据保留。此前外部键鼠及截图不可用的限制，本轮未补充外部交互验收；原生窗口内派发不能替代物理HID或像素证明。范围见 `docs/KNOWN_LIMITATIONS.md`，不是完整Notepad++替代品交付。
 
@@ -37,13 +37,13 @@
 | 任务 | 当前状态 |
 |---|---|
 | T01 仓库/工具链/记录 | 已建立；锁文件、运行说明、许可证与报告齐全 |
-| T02 原生窗口 | macOS Apple Silicon与Windows 11 ARM64（Parallels桌面）实际运行通过；Windows x64裸机与Linux桌面GUI未验证 |
+| T02 原生窗口 | macOS Apple Silicon与Windows 11 ARM64（Parallels桌面，ADR 014版本）实际运行通过；Windows x64裸机与Linux桌面GUI未验证 |
 | T03 混合候选 | 已完成候选实验与回退决策；NSH采用门槛未通过 |
 | T04 文档适配/候选收敛 | 本轮事务及版本场景通过，默认Kit-only |
 | T05 打开/编码/保存 | UTF-8/BOM/LF/CRLF、安全保存与冲突核心场景通过；原生系统文件面板边界未穷尽 |
 | T06 草稿/会话 | 正常退出恢复、空白草稿、100标签惰性启动通过 |
 | T07 故障边界 | 服务进程中断及保存阶段注入通过；真实掉电未验证 |
-| T08 编辑工具/搜索 | 搜索替换、事务、高亮、命令面板、快速切换、活动选区行编辑及视图配置已实现；真实IME/矩形选择完整交互验收未完成 |
+| T08 编辑工具/搜索 | 搜索替换、事务、高亮、命令面板、快速切换、视图配置、活动选区行编辑，以及`Alt+Shift`矩形列选/`AddCursorAbove`/`AddCursorBelow` CRLF多光标单次撤销已通过`--smoke=usability`；自定义行操作仍限活动选区，真实系统IME候选窗未验收 |
 | T09 分页/长行 | 服务与实际原生视图已验证；不是大文件可编辑 |
 | T10 流式搜索 | 跨块、64位末尾、限额与取消已验证 |
 | T11 索引/源变化 | 渐进索引预算、追加/截断/替换失效服务场景通过 |
@@ -52,15 +52,15 @@
 | T14 LSP | 不再作为本体目标；未来可由插件提供，当前未实施 |
 | T15 图片查看器 | 未实施 |
 | T16 离线扩展包 | 未实施；已有依赖/资源许可清单不等于扩展包 |
-| T17 性能收敛 | 已有同机真实实验与原生提交基线；首帧、IME、全平台持续资源分布未完成 |
-| T18 两平台发布 | 五目标CI（`43204649933`）全部通过三平台原子安全保存与打包核验；Mac ARM与Windows 11 ARM64桌面GUI及原生`Save As`对话框实跑通过。Windows x64裸机/Linux/Mac Intel桌面GUI、签名/公证及安装包未交付 |
+| T17 性能收敛 | 已有同机真实实验与原生提交基线；ADR 016已实现百万唯一短行首帧344.53 ms及全量收敛464.97 MiB均值RSS；物理屏幕首帧、真实IME与全平台持续资源分布未完成 |
+| T18 两平台发布 | ADR 013/014五目标CI（`43204649933`）通过安全保存与打包核验且Mac ARM / Windows 11 ARM64实跑通过；ADR 015/016已补齐Windows GUI子系统/PE校验/路径展示剥离源码与本地单测，待下一次CI与Windows桌面复验；Windows x64裸机/Linux/Mac Intel桌面GUI、签名/公证及安装包未交付 |
 
 ## 后续推进顺序
 
 1. 公开仓库与五目标CI开发构建已完成；后续保持构建、CLI、GUI和性能验收分开记录。
-2. 本体保持纯编辑器定位，不引入项目模型或LSP。标签组与不同文档分屏、单编辑器IME修复、普通加载Rope接管及首次折行快路径（ADR013）、三平台原子安全保存（ADR014）均已通过五目标CI及macOS ARM / Windows 11 ARM64真实桌面验收。Windows桌面实测记录到两项后续体验打磨点：独立启动`editor.exe`时保留了CLI所需的控制台子系统黑框，状态栏显示`canonicalize`产生的`\\?\C:\...`扩展路径前缀。
-3. 下一阶段性能与功能重点：针对缓存不利的百万唯一短行（macOS上仍约2.27 GiB峰值、7.38秒首帧全量同步整形），设计视口优先或有界分块渐进折行及长期多文档常驻内存治理；评估将`spikes/multiview-paged`只读共享源多视口接入主应用，再单独设计可编辑同文档多视图；补Windows细节打磨（去`\\?\`显示前缀、GUI/CLI双入口或`AttachConsole`）、物理系统输入法候选窗、矩形选择与Windows x64裸机/Linux桌面验收。
-4. NSH/SDK仍须通过兼容、IME、主题和焦点门槛，不绑定主编辑路径。平台构建产物不等于签名、公证、安装包或完整交互验收。
+2. 本体保持纯编辑器定位，不引入项目模型或LSP。标签组与不同文档分屏、单编辑器IME修复、普通加载与视口优先渐进折行（ADR012/013/016）、三平台原子安全保存（ADR014）、Windows GUI子系统与路径展示剥离（ADR015）及T08列选/垂直多光标已实现并在macOS ARM64完成回归验证。
+3. 下一阶段重点：触发五目标CI与Parallels Windows桌面复验ADR 015/016重建产物（实测无黑框启动、CLI重定向与`\\?\`显示剥离）；先完成`layout format v3`及统一关闭/重载/预算设计，再评估将`spikes/multiview-paged`只读共享源多视口（以及后续可编辑同文档多视图）接入主应用；补齐物理系统输入法候选窗、Windows x64裸机/Linux/macOS Intel桌面GUI、签名公证与安装包交付。
+4. NSH/SDK（T12–T16）仍暂缓于`spikes/nsh-eval`，须先通过兼容、IME、主题和焦点门槛，不绑定主编辑路径。平台构建产物不等于签名、公证、安装包或完整交互验收。
 
 ## 性能实验原则
 

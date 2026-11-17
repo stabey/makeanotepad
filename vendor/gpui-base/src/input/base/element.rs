@@ -62,6 +62,7 @@ const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
 const MAX_LINE_NUMBER_DIGITS: usize = 7;
 const MAX_DISPLAYED_LINE_NUMBER: usize = 9_999_999;
+const VIEWPORT_WRAP_MARGIN_ROWS: usize = 128;
 
 fn line_number_len(total_lines: usize) -> usize {
     (total_lines.max(1).ilog10() as usize + 1).clamp(MIN_LINE_NUMBER_DIGITS, MAX_LINE_NUMBER_DIGITS)
@@ -3000,10 +3001,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // to, inside the frame that clips it, and springs back over the next
         // frames. Scrolling and everything measured from it stay exact.
         let mut stretch = self.state.update(cx, |state, cx| {
-            state.display_map.set_font(font, text_size, cx);
-            let tab_size = state.mode.tab_size().tab_size;
-            state.display_map.set_tab_size(tab_size, cx);
-            state.display_map.ensure_text_prepared(&state.text, cx);
             if cx.reduce_motion() {
                 state.overscroll.reset();
             } else if state.overscroll.step(cx.background_executor().now()) {
@@ -3048,26 +3045,60 @@ impl<M: InputModeKind> Element for TextElement<M> {
         };
 
         let wrapping_indent = state.wrapping_indent;
-        let wrap_width_changed = state
-            .last_layout
-            .as_ref()
-            .map(|l| l.wrap_width != wrap_width)
-            .unwrap_or(true);
-
-        let wrapping_indent_changed = state
-            .last_layout
-            .as_ref()
-            .map(|l| l.wrapping_indent != wrapping_indent)
-            .unwrap_or(true);
-
-        if wrap_width_changed || wrapping_indent_changed {
-            self.state.update(cx, |state, cx| {
-                state.display_map.on_layout_changed(wrap_width, cx);
-                state.display_map.set_wrapping_indent(wrapping_indent, cx);
-            });
-        }
-
         let line_height = window.line_height();
+        let cursor_offset = state.cursor().min(text.len());
+        let cursor_row = text.offset_to_point(cursor_offset).row;
+        let priority_row = state
+            .last_layout
+            .as_ref()
+            .and_then(|layout| layout.visible_buffer_lines.first().copied())
+            .unwrap_or(cursor_row);
+
+        self.state.update(cx, |state, cx| {
+            let layout_config_matches = state.last_layout.as_ref().is_some_and(|l| {
+                l.wrap_width == wrap_width && l.wrapping_indent == wrapping_indent
+            });
+            let anchor_line = (layout_config_matches && state.display_map.pending_wrap_rows() > 0)
+                .then(|| {
+                    state
+                        .last_layout
+                        .as_ref()
+                        .and_then(|layout| layout.visible_buffer_lines.first().copied())
+                })
+                .flatten();
+            let old_anchor_display =
+                anchor_line.map(|line| state.display_map.buffer_line_to_display_row(line));
+
+            let did_progressive_step = state
+                .display_map
+                .sync_layout_for_paint(
+                    &state.text,
+                    font.clone(),
+                    text_size,
+                    state.mode.tab_size().tab_size,
+                    wrapping_indent,
+                    wrap_width,
+                    priority_row,
+                    cx,
+                )
+                .is_progressive_step();
+
+            if did_progressive_step && state.deferred_scroll_offset.is_none() {
+                let cur = state.scroll_handle.offset();
+                if cur.y < px(0.)
+                    && let (Some(anchor_line), Some(old_disp)) = (anchor_line, old_anchor_display)
+                {
+                    let new_disp = state.display_map.buffer_line_to_display_row(anchor_line);
+                    let delta = new_disp as isize - old_disp as isize;
+                    if delta != 0 {
+                        state
+                            .scroll_handle
+                            .set_offset(point(cur.x, cur.y - (delta as f32) * line_height));
+                    }
+                }
+            }
+        });
+
         let token_elements = self.measure_tokens(
             (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.)),
             line_height,
@@ -3077,8 +3108,42 @@ impl<M: InputModeKind> Element for TextElement<M> {
         );
         let state = self.state.read(cx);
 
-        let (visible_range, visible_buffer_lines, visible_top) =
+        let (mut visible_range, mut visible_buffer_lines, mut visible_top) =
             self.calculate_visible_range(&state, line_height, bounds.size.height);
+        if state.display_map.pending_wrap_rows() > 0 {
+            let buffer_line_count = text.lines_len();
+            let margin_range = visible_range
+                .start
+                .saturating_sub(VIEWPORT_WRAP_MARGIN_ROWS)
+                ..(visible_range.end + VIEWPORT_WRAP_MARGIN_ROWS).min(buffer_line_count);
+            let cursor_range =
+                cursor_row.saturating_sub(64)..(cursor_row + 65).min(buffer_line_count);
+            let wrapped_now = self.state.update(cx, |state, cx| {
+                let mut wrapped = state.display_map.ensure_rows_wrapped(margin_range, cx);
+                wrapped |= state.display_map.ensure_rows_wrapped(cursor_range, cx);
+                wrapped
+            });
+            if wrapped_now {
+                let state = self.state.read(cx);
+                (visible_range, visible_buffer_lines, visible_top) =
+                    self.calculate_visible_range(&state, line_height, bounds.size.height);
+                if state.display_map.pending_wrap_rows() > 0
+                    && self.state.update(cx, |state, cx| {
+                        state
+                            .display_map
+                            .ensure_rows_wrapped(visible_range.clone(), cx)
+                    })
+                {
+                    let state = self.state.read(cx);
+                    (visible_range, visible_buffer_lines, visible_top) =
+                        self.calculate_visible_range(&state, line_height, bounds.size.height);
+                }
+            }
+        }
+        let state = self.state.read(cx);
+        if state.display_map.pending_wrap_rows() > 0 {
+            window.request_animation_frame();
+        }
         let visible_start_offset = state.text.line_start_offset(visible_range.start);
         let visible_end_offset = state
             .text

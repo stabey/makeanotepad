@@ -18,6 +18,7 @@ use editor_services::{
 #[path = "session_core.rs"]
 mod session_core;
 use crate::group_ui::GroupUiState;
+use gpui_kit::base::input::{AddCursorAbove, AddCursorBelow};
 use gpui_kit::component::button::{ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandState;
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -2646,6 +2647,8 @@ impl EditorWorkspace {
                 | PaletteCommandTarget::EditUndo
                 | PaletteCommandTarget::EditRedo
                 | PaletteCommandTarget::EditSelectAll
+                | PaletteCommandTarget::AddCursorAbove
+                | PaletteCommandTarget::AddCursorBelow
                 | PaletteCommandTarget::IndentSelection
                 | PaletteCommandTarget::OutdentSelection
                 | PaletteCommandTarget::DuplicateLine
@@ -2761,6 +2764,18 @@ impl EditorWorkspace {
                 if let Some(TabSlot::Editable(ed)) = self.active_slot() {
                     ed.focus(window, cx);
                     window.dispatch_action(Box::new(SelectAll), cx);
+                }
+            }
+            PaletteCommandTarget::AddCursorAbove => {
+                if let Some(TabSlot::Editable(ed)) = self.active_slot() {
+                    ed.focus(window, cx);
+                    window.dispatch_action(Box::new(AddCursorAbove), cx);
+                }
+            }
+            PaletteCommandTarget::AddCursorBelow => {
+                if let Some(TabSlot::Editable(ed)) = self.active_slot() {
+                    ed.focus(window, cx);
+                    window.dispatch_action(Box::new(AddCursorBelow), cx);
                 }
             }
             PaletteCommandTarget::IndentSelection => {
