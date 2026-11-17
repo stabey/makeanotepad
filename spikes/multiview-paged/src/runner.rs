@@ -1746,6 +1746,7 @@ async fn open_paged_source_off_thread(
                         language_override: None,
                         readonly_reason: Some(readonly_reason.clone()),
                         paged: true,
+                        image_preview: false,
                     };
                     Ok(PagedSourceState::new(
                         doc_id,
@@ -1758,6 +1759,10 @@ async fn open_paged_source_off_thread(
                 }
                 OpenOutcome::Editable { .. } => Err(format!(
                     "expected OpenOutcome::Paged for '{}', got OpenOutcome::Editable",
+                    path.display()
+                )),
+                OpenOutcome::Image(_) => Err(format!(
+                    "expected OpenOutcome::Paged for '{}', got OpenOutcome::Image",
                     path.display()
                 )),
             }

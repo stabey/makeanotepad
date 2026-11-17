@@ -1,8 +1,8 @@
 # Native text editor
 
-Rust + GPUI Kit 文本编辑器。产品与验收基线见 [交接文档](Rust_GPUI_Editor_Agent_Handoff_v1.0.md)，当前状态见 [IMPLEMENTATION_STATUS](IMPLEMENTATION_STATUS.md)。默认应用与NSH候选实验隔离；本地原生桌面GUI验收目前已覆盖macOS Apple Silicon与Windows 11 ARM64（Parallels虚拟机），其余CI目标的构建与无窗口验证不等于完整桌面支持。
+Rust + GPUI Kit 文本编辑器。产品与验收基线见 [交接文档](Rust_GPUI_Editor_Agent_Handoff_v1.0.md)，当前状态见 [IMPLEMENTATION_STATUS](IMPLEMENTATION_STATUS.md)。默认应用与NSH候选实验隔离；本地原生桌面GUI验收目前已覆盖macOS Apple Silicon（含ADR 017/018）与Windows 11 ARM64（Parallels虚拟机，ADR 013/014构建），其余CI目标的构建与无窗口验证不等于完整桌面支持。
 
-产品定位是接近Notepad++的纯文本编辑器：本体优先保证编辑、保存恢复、大文件、多文件、标签页组及单窗口分屏。项目模型和LSP不作为本体目标；未来如需这些能力，通过插件提供。当前已实现标签页组和不同文档的单窗口分屏；同一文档的独立多视图仍未进入主应用（`spikes/multiview-paged`仅作只读隔离实验，主应用启用前需先完成`layout format v3`设计）。
+产品定位是接近Notepad++的纯文本编辑器：本体优先保证编辑、保存恢复、大文件、多文件、标签页组及单窗口分屏。项目模型和LSP不作为本体目标；未来如需这些能力，通过插件提供。当前已实现标签页组、不同文档的单窗口分屏、主应用**只读**同文档多视口（`schema v3 / format v3`，覆盖分页大文件与图像预览），以及按交接文档§10.1/§14.4 Kit-only回退路线内置的纯Rust无损JSON/JSONC工具与有界只读光栅图像预览；**可编辑（Editable）同文档多视图仍为NO-GO**，NSH TS/TSX插件运行时（`T12`、`T16`）仍暂缓。
 
 ## 构建环境
 
@@ -26,7 +26,7 @@ cargo test --locked --workspace
 
 在成功运行的 **Artifacts** 中下载对应目标的ZIP，保留14天。产物含`editor`/`editor.exe`、服务CLI、构建身份、SHA-256、目标相关许可证清单及许可文件。它们是开发构建，不是安装包或正式签名/公证版本；系统运行库仍由目标环境提供。
 
-原子安全保存现支持macOS、Linux与Windows（其余未知平台产物仍会携带`EXPERIMENTAL-CANNOT-SAVE.txt`）。其中macOS ARM64与Windows 11 ARM64（ADR 014构建）已完成真实桌面窗口及保存闭环验收（Windows 11含原生`IFileSaveDialog`另存为与帧缓冲截图）；Windows版GUI子系统防黑框（`windows_subsystem = "windows"` + 管道安全`AttachConsole`）及Fail-closed `\\?\`路径展示剥离已在代码与打包校验中完成（ADR 015），待下一次Windows CI及桌面运行复验。Windows x64裸机、Linux x64与macOS Intel目前仅完成CI测试与无窗口服务验证，且全平台真实系统输入法候选窗、签名/公证与安装包仍待交付或人工验收。草稿恢复仍不能替代显式保存文件。
+原子安全保存现支持macOS、Linux与Windows（其余未知平台产物仍会携带`EXPERIMENTAL-CANNOT-SAVE.txt`）。其中macOS ARM64与Windows 11 ARM64（ADR 014构建）已完成真实桌面窗口及保存闭环验收（Windows 11含原生`IFileSaveDialog`另存为与帧缓冲截图）；Wave 0提交`91c301c`（ADR 015/016）已在[Native CI 44015994062](https://github.com/stabey/makeanotepad/actions/runs/44015994062)全部6个job一次通过（包含两个Windows目标的PE GUI/CUI子系统校验，产物可用于用户Windows实机测试），ADR 017/018待下一次推送触发CI。Windows版（ADR 015–018）桌面GUI复验、Windows x64裸机、Linux x64与macOS Intel桌面GUI、全平台真实系统输入法候选窗、签名/公证与安装包仍待交付或人工验收。草稿恢复仍不能替代显式保存文件。
 
 CI在五个原生目标上均运行无需窗口的`--help`、`--version`、100文档惰性会话验证及保存/故障注入服务验证（`services_smoke`）。它不执行GUI smoke，不证明真实IME、鼠标交互、GPU兼容或性能指标。具体状态以运行日志及ZIP中的`BUILD_IDENTITY.txt`、`HEADLESS_SMOKE.json`为准。
 
@@ -56,7 +56,11 @@ CI在五个原生目标上均运行无需窗口的`--help`、`--version`、100�
 
 矩形/列选与`AddCursorAbove`/`AddCursorBelow`垂直多光标支持原生多光标编辑与单次撤销并保持`\r\n`边界完整；自定义复制/删除/移动/注释命令仍只处理**活动选区**，会收敛其他光标（因`gpui-base`未公开完整`selections`集合）；原生缩进保留Kit自身的多光标行为。单次行操作跨度/输出限制4 MiB，超限拒绝而非部分修改。JSON、纯文本、CSS、HTML、XML、Markdown不提供伪行注释。
 
-底部状态栏可选择语言、LF/CRLF、UTF-8/BOM、空格/Tab及2/4/8宽度，并切换折行、空白字符显示。语言和显示选项不修改文件；编码/换行变化会标记已保存文件为未保存，并进入恢复保护。只读/分页文档禁用不适用的写入选项。
+底部状态栏可选择语言、LF/CRLF、UTF-8/BOM、空格/Tab及2/4/8宽度，并切换折行、空白字符显示。语言和显示选项不修改文件；编码/换行变化会标记已保存文件为未保存，并进入恢复保护。只读/分页/图像文档禁用不适用的写入选项。
+
+依据交接文档§10.1与§14.4的Kit-only回退路线，内置提供纯Rust工具而不启用NSH JS运行时：
+- **Tools** 菜单与命令面板支持无损 **JSON / JSONC** 校验、格式化与压缩（`Validate` / `Format` / `Minify`；4 MiB与2048深度上限，原样保留大整数、重复键、`-0`、指数、转义、Unicode及JSONC注释与尾随逗号；格式错误时跳转光标提示，改写仅生成`1`次`Undo`并持久化至SQLite）。
+- 自动识别常见光栅图像（`PNG`、`JPEG`、`WebP`、`GIF`、`BMP`、`ICO`、`TIFF`）并经由`32 MiB`文件/`8192 px`/`128`帧/`128 MiB`解码RGBA头闸门后以只读预览打开；支持 **View** 菜单与工具栏缩放（`Fit` / `10%–800%`）及全工作区`256 MiB` LRU缓存回收（显式`cx.drop_image`释放GPU纹理）。**`.svg`仍作为可编辑XML文本打开，不作为光栅图像预览。**
 
 最近文件与显示偏好保存在数据目录的 `ui_shell.json`；会话文本仍由独立SQLite恢复库负责。偏好后台合并写入，可见窗格的编辑器即时应用，不可见标签在变为可见时惰性应用。损坏偏好文件在首次替换前保留独立备份，不因启动而直接覆写。
 
@@ -87,6 +91,7 @@ CI在五个原生目标上均运行无需窗口的`--help`、`--version`、100�
 |---|---|
 | `Cmd+\` / `Cmd+Shift+\` | 向右 / 向下拆分 |
 | `Cmd+Alt+\` / `Cmd+Alt+Shift+\` | 向左 / 向上拆分 |
+| `Cmd+Alt+Shift+L` / `Cmd+Alt+Shift+J` | 向右 / 向下拆分并克隆只读多视口（Win/Linux `Ctrl+Alt+Shift+L/J`） |
 | `F6` / `Shift+F6` | 聚焦下一个 / 上一个窗格 |
 | `Cmd+Alt+Shift+N` / `Cmd+Alt+Shift+P` | 将当前标签移到下一个 / 上一个窗格 |
 | `Cmd+Alt+=` | 均衡窗格大小 |
@@ -95,19 +100,21 @@ CI在五个原生目标上均运行无需窗口的`--help`、`--version`、100�
 
 拖动分隔线调整尺寸，`Escape`取消此次调整；拖动标签到另一窗格中央可移动，到边缘可拆分并移动，到组标题可重新分组。预览不修改正文；无效目标、容量不足或取消不会留下半完成的移动。
 
+对只读文档（`Paged`分页大文件与`Image`光栅图像预览），还可通过上述拆分克隆快捷键或 **Panes → Duplicate Read-Only View in Pane**（及标签右键/窗格菜单）在同一或不同窗格打开同一文档的独立视口，共享单个底层源与缓存预算、独立保存偏移或缩放，且在仍有次视图存活时关闭次视图免弹窗立即移除；**可编辑（Editable）文档同文档多视图仍为NO-GO**。
+
 **Close Pane (Merge Tabs into Adjacent Pane)**不会关闭文档；**Close All Tabs in Active Pane…**才是需要草稿保护确认的关闭操作。点击正文后，输入、保存、搜索和行操作作用于该窗格的当前文档。窗格树、比例、标签位置和选择会恢复，文本实体与撤销历史不会因移动而复制或重置。
 
 交互拆分保证每个窗格至少240×160逻辑像素；窗口太小时显示 **Compact** 提示并暂时只显示焦点窗格，放大后恢复原布局，不删除隐藏窗格。所有窗格共享原有内容、页缓存和索引预算；恢复先加载焦点文档，再逐个加载其他可见文档，预算不足的标签保留并显示原因。
 
 ## 数据安全
 
-普通文档的修改与用户文件保存分开：草稿恢复成功不能清除 dirty。恢复文档不自动覆盖磁盘来源。只读分页文件不会全文复制进恢复库。
+普通文档的修改与用户文件保存分开：草稿恢复成功不能清除 dirty。恢复文档不自动覆盖磁盘来源。只读分页文件与图像文件不会全文复制进恢复库。
 
 使用 `--data-dir` 可将验证数据与个人会话隔离。卸载二进制不应自动删除恢复数据；手动删除数据目录前先导出需要的未保存草稿。生成的大文件和临时测试会话不提交到版本控制。
 
-旧会话仍可原子迁移到SQLite schema v2；本轮保持数据库schema不变，将布局格式扩展到format v2以保存分屏。format v1在内存中升级，正常布局写入时才产生新快照。升级前请关闭旧实例并备份整个数据目录；旧版不能读取新布局，保留旧快照不等于支持直接降级。未知未来布局格式拒绝写入；已知格式的损坏布局保留原始记录，再尝试最近有效布局和元数据恢复。
+旧会话可原子迁移到SQLite `schema v3`与`layout format v3`（原子重建`layout_views`表移除`UNIQUE(view_set, doc)`约束以支持只读同文档多视口）；`v1`/`v2`布局在内存中升级，正常布局写入时才产生新快照。升级前请关闭旧实例并备份整个数据目录；旧版不能读取新布局，保留旧快照不等于支持直接降级。未知未来布局格式与字段在只读预检中拒绝写入；已知格式的损坏布局保留原始记录，再尝试最近有效布局和元数据恢复。
 
-不传 `--data-dir` 时，macOS恢复目录为 `~/Library/Application Support/com.makeaedittool.editor`，数据库文件为 `recovery.sqlite3`。不要将它放到网络共享目录或同步盘。普通编辑器合计内容准入默认256 MiB、最多128个已hydrate编辑器；这些不是RSS硬上限，撤销历史和布局缓存另占内存。单文件超过64 MiB默认只读分页，不冒充任意大文件可编辑。
+不传 `--data-dir` 时，macOS恢复目录为 `~/Library/Application Support/com.makeaedittool.editor`，数据库文件为 `recovery.sqlite3`。不要将它放到网络共享目录或同步盘。普通编辑器合计内容准入默认256 MiB、最多128个已hydrate编辑器，工作区已解码图像缓冲共享256 MiB LRU上限；这些不是RSS硬上限，撤销历史和布局缓存另占内存。单文件超过64 MiB默认只读分页，不冒充任意大文件可编辑。
 
 原生自动化验证使用隔离目录，报告在正常退出与恢复shutdown确认后写出：
 
@@ -123,7 +130,7 @@ target/release/editor --data-dir .smoke-data/ime-check --smoke=ime --smoke-repor
 
 本地维护`gpui-base 0.9.0`的**六个源文件**（`state.rs`、`undo_manager.rs`、`element.rs`、`display_map.rs`、`wrap_map.rs`、`text_wrapper.rs`）：涵盖IME结算/历史发布、普通文件Rope接管与顺序行布局、256上限`WindowTextSystem`缓存轮换、视口优先渐进折行与CRLF多光标边界修复；依赖版本和应用层提交屏障不变，新增仅用于新建EditorMode的Rope接管构造器。来源和维护边界见[vendor notice](vendor/gpui-base/NOTICE-IME-PATCH.json)与ADR011–ADR013、ADR016。该补丁不提供共享可编辑多视图，也不等于真实系统输入法候选窗口已验收。
 
-同机ADR016配对release对照（67,108,860 B，warm/unspecified `/tmp`）中：缓存不利的1,048,576行全唯一短行（`short_unique`）首帧就绪时间由7.10秒（7,104.93 ms）降至**344.53 ms**、首帧peak RSS由2324.72 MiB降至**355.93 MiB**（首帧后待折行约1,043,450行），开启`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`完成100%精确折行收敛后全过程peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（后台收敛均值**9.28秒**）；常规重复短行首帧就绪由422.11降至321.12 ms。本地工作区166个测试、9个CI打包测试、27个私有行布局测试、11个私有IME历史测试、1个CRLF列选边界测试及7项原生macOS窗口回归通过；不承诺任意文本形态或冷盘达到相同数字，测量边界与原始证据见[性能记录](docs/PERFORMANCE_REPORT.md)与[测试记录](docs/TEST_REPORT.md)。
+同机ADR016配对release对照（67,108,860 B，warm/unspecified `/tmp`）中：缓存不利的1,048,576行全唯一短行（`short_unique`）首帧就绪时间由7.10秒（7,104.93 ms）降至**344.53 ms**、首帧peak RSS由2324.72 MiB降至**355.93 MiB**（首帧后待折行约1,043,450行），开启`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`完成100%精确折行收敛后全过程peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（后台收敛均值**9.28秒**）；常规重复短行首帧就绪由422.11降至321.12 ms。合入ADR 017/018后的最新macOS ARM64本地全量验证通过：工作区**195**个测试（`82 + 27 + 86`）、9个CI打包测试、27个私有行布局测试、11个私有IME历史测试、1个CRLF列选边界测试、`editor-services smoke` 6场景以及8次原生macOS窗口回归（含`usability` + Restart A与`splits` + Restart B），同时Wave 0提交`91c301c`已通过[Native CI 44015994062](https://github.com/stabey/makeanotepad/actions/runs/44015994062)全部6个job；不承诺任意文本形态、冷盘或未测平台达到相同数字，测量边界与原始证据见[性能记录](docs/PERFORMANCE_REPORT.md)、[测试记录](docs/TEST_REPORT.md)与[ADR 017/018回归报告](docs/evidence/adr017-018-native-regressions.json)。
 
 ## 候选运行时
 
@@ -143,7 +150,7 @@ CARGO_TARGET_DIR="$PWD/target" cargo run --locked --release --manifest-path spik
 CARGO_TARGET_DIR="$PWD/target" cargo run --locked --release --manifest-path spikes/multiview-paged/Cargo.toml --bin multiview-paged -- --views 8 --report /tmp/multiview-paged.json
 ```
 
-普通编辑器诊断的退出码`2`表示实验完成但发现安全断言失败；受维护补丁后的实际运行为exit `0`，12个产品断言通过，包括此前失败的6项。旧`source_prediction`仅记录未修改版本的预测，不是补丁后的验收条件。分页实验以一个真实文件源挂载`1/2/4/8`个独立虚拟视口；大于4 GiB的稀疏夹具仅验证偏移正确性，不能作为吞吐成绩。该实验保持只读隔离，主应用启用同文档多视图仍需先完成`layout format v3`设计；可编辑共享文本、真实系统IME候选窗、裸机Win x64/Linux/Mac Intel桌面GUI、签名公证/安装包及NSH（T12–T16）仍未交付或未验收，详见架构决策和测试记录。
+普通编辑器诊断的退出码`2`表示实验完成但发现安全断言失败；受维护补丁后的实际运行为exit `0`，66阶段/0失败断言（含此前失败的6项）。旧`source_prediction`仅记录未修改版本的预测，不是补丁后的验收条件。分页实验以一个真实文件源挂载`1/2/4/8`个独立虚拟视口（`--views 8` 66帧、`total_elapsed_ms = 814.08 ms`、14/14校验标志通过且关闭至零后缓存/索引归零）；大于4 GiB的稀疏夹具仅验证偏移正确性，不能作为吞吐成绩。主应用目前已通过`schema v3 / layout format v3`启用**只读**同文档多视口（`Paged`与`Image`），而**可编辑（Editable）同文档多视图仍为NO-GO**；此外，真实系统IME候选窗、Windows（ADR 015–018）及裸机Win x64/Linux/Mac Intel桌面GUI、签名公证/安装包、LSP（`T14`）及NSH/TSX扩展运行时（`T12`、`T16`）仍未交付或未验收，详见[架构决策](docs/ARCHITECTURE_DECISIONS.md)和[测试记录](docs/TEST_REPORT.md)。
 
 ## 证据
 

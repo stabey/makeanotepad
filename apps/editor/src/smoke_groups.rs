@@ -170,11 +170,28 @@ async fn run_batch_open_regression(
             })
         })
         .map_err(|error| error.to_string())??;
-    wait_until(Duration::from_secs(30),cx,|cx|cx.update(|cx|{
-        let ws=workspace.read(cx);
-        !ws.is_lifecycle_busy()&&ws.session_layout().view_count()==1&&ws.hydrated_editor_count()==0
-            &&matches!(ws.view_slot(original.view_id),Some(TabSlot::Paged(view)) if view.meta.path.as_ref()==Some(&paged)&&view.current_slice.is_some()&&matches!(view.index_status,editor_services::IndexStatus::Complete{..}))
-    }),"failed first path drains into real Paged replacement, initial viewport and sparse index").await?;
+    wait_until(
+        Duration::from_secs(30),
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && ws.session_layout().view_count() == 1
+                    && ws.hydrated_editor_count() == 0
+                    && ws.paged_view(original.view_id).is_some_and(|(view, vp)| {
+                        view.meta.path.as_ref() == Some(&paged)
+                            && vp.current_slice.is_some()
+                            && matches!(
+                                view.index_status,
+                                editor_services::IndexStatus::Complete { .. }
+                            )
+                    })
+            })
+        },
+        "failed first path drains into real Paged replacement, initial viewport and sparse index",
+    )
+    .await?;
     let paged_target = cx.update(|cx| -> Result<ViewTarget, String> {
         let ws = workspace.read(cx);
         let target = ws
@@ -1234,8 +1251,14 @@ pub(crate) fn verify_post_shutdown_layout(
         if manifest.layout != *expected {
             return Err("complete restart layout differs in pane tree/ratios/focus, group metadata/order/membership, or view identity/selection/positions".into());
         }
-        if manifest.documents.len() != expected.views.len() {
-            return Err("restart document/layout bijection differs".into());
+        let expected_unique_docs = expected
+            .views
+            .values()
+            .map(|v| v.document)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if manifest.documents.len() != expected_unique_docs {
+            return Err("restart document/layout unique-document set differs".into());
         }
         if let Some(bulk) = &report.expected_bulk_group {
             if !report.group_bulk_cancel_verified

@@ -67,6 +67,7 @@
 //! dense indexing, lazy sessions, smoke and process-exit fault scenarios. Run it
 //! without arguments for usage. A passing process-exit test is not a power-cut test.
 
+mod image_probe;
 mod open;
 mod paging;
 mod recovery;
@@ -77,6 +78,7 @@ mod types;
 mod ui_shell;
 
 pub use crossbeam_channel::{Receiver, TryRecvError};
+pub use image_probe::*;
 pub use open::*;
 pub use paging::*;
 pub use recovery::*;

@@ -1,24 +1,29 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use editor_services::{
     CancelToken, DocMeta, DocumentId, DocumentKey, EncodingSpec, FaultInjector, GroupColor,
-    GroupCommand, GroupId, LifecycleGen, LineEnding, RecoveryHandle, Revision, SearchAlgorithm,
-    SessionDocumentStub, SessionLayout, UiShellStore, ViewTarget,
+    GroupCommand, GroupId, LifecycleGen, LineEnding, RasterImageFormat, RecoveryHandle, Revision,
+    SearchAlgorithm, SessionDocumentStub, SessionLayout, UiShellStore, ViewTarget, ViewportAnchor,
 };
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::InputState;
-use gpui_kit::{AnyWindowHandle, AsyncApp, Entity, EntityInputHandler as _, Focusable as _};
+use gpui_kit::{
+    Action, AnyWindowHandle, AsyncApp, Entity, EntityInputHandler as _, Focusable as _, RenderImage,
+};
 use serde::Serialize;
 
 use crate::actions::{
-    DuplicateLine, MoveLineDown, MoveLineUp, SaveFile, ToggleComment, ToggleLineEnding,
-    ToggleThemeMode, ToggleUtf8Bom,
+    CloseActivePane, CloseActiveTab, DuplicateLine, FormatJson, FormatJsonc, ImageZoomActualSize,
+    ImageZoomFit, ImageZoomIn, MinifyJson, MoveLineDown, MoveLineUp, ReloadActiveDocument,
+    SaveFile, SplitAndCloneActiveViewRight, ToggleComment, ToggleLineEnding, ToggleThemeMode,
+    ToggleUtf8Bom, ValidateJson,
 };
 use crate::app::{EditorWorkspace, TabSlot};
 use crate::cli::SmokeScenario;
 use crate::editor_adapter::{ApplyEditsError, compute_metadata_dirty};
+use crate::image_view::{ImagePayloadState, ImageZoomMode};
 use crate::search_bar::{SearchQueryKind, SearchStatus};
 use crate::shell::EditorViewPrefs;
 #[path = "smoke_groups.rs"]
@@ -118,6 +123,9 @@ pub struct SmokeReport {
     pub pending_wrap_rows_after_first_draw: usize,
     pub full_wrap_converged_ms: Option<f64>,
     pub columnar_multicursor_single_undo_verified: bool,
+    pub multiview_paged_shared_source_verified: bool,
+    pub json_lossless_and_undo_verified: bool,
+    pub image_viewer_budget_and_release_verified: bool,
     #[serde(skip)]
     pub expected_session_layout: Option<SessionLayout>,
     #[serde(skip)]
@@ -201,11 +209,13 @@ pub fn spawn_smoke_runner(
         match run_result {
             Ok(()) => {
                 if matches!(scenario, SmokeScenario::Usability)
-                    && !report.columnar_multicursor_single_undo_verified
+                    && (!report.columnar_multicursor_single_undo_verified
+                        || !report.json_lossless_and_undo_verified
+                        || !report.image_viewer_budget_and_release_verified)
                 {
                     report.in_app_checks_passed = false;
                     report.failure_reason = Some(
-                        "usability scenario finished without columnar_multicursor_single_undo_verified"
+                        "usability scenario finished without all required verification flags"
                             .to_string(),
                     );
                 } else {
@@ -313,14 +323,27 @@ async fn run_startup_scenario(
                             Some(TabSlot::Dehydrated(_) | TabSlot::Hydrating { .. }) | None => {
                                 false
                             }
-                            Some(TabSlot::Paged(view)) => {
-                                view.current_slice.is_some() || view.source_error.is_some()
+                            Some(TabSlot::Paged(_)) => {
+                                ws.paged_view(target.view_id).is_some_and(|(view, vp)| {
+                                    vp.current_slice.is_some()
+                                        || view.source_error.is_some()
+                                        || vp.viewport_error.is_some()
+                                })
                             }
+                            Some(TabSlot::Image(img)) => !matches!(
+                                img.state,
+                                crate::image_view::ImagePayloadState::Dehydrated
+                                    | crate::image_view::ImagePayloadState::Decoding { .. }
+                            ),
                             _ => true,
                         });
                 ws.recovery_ready
                     && visible_settled
-                    && ws.active_slot().is_some()
+                    && (ws.active_slot().is_some()
+                        || (ws
+                            .pane_view_ids(ws.active_pane_id())
+                            .is_some_and(|t| t.is_empty())
+                            && ws.visible_targets().next().is_some()))
                     && !ws.is_compact_layout()
                     && !ws.is_focus_only()
                     && ws.measured_visible_pane_count() == ws.visible_pane_ids().count()
@@ -392,8 +415,23 @@ async fn run_startup_scenario(
                 }
                 let active_ready = match ws.active_slot() {
                     Some(TabSlot::Editable(editor)) => !editor.has_pending_native_edit(cx),
-                    Some(TabSlot::Paged(view)) => {
-                        view.current_slice.is_some() && view.source_error.is_none()
+                    Some(TabSlot::Paged(_)) => ws
+                        .active_view_id()
+                        .and_then(|id| ws.paged_view(id))
+                        .is_some_and(|(view, vp)| {
+                            vp.current_slice.is_some()
+                                && view.source_error.is_none()
+                                && vp.viewport_error.is_none()
+                        }),
+                    Some(TabSlot::Image(img)) => !matches!(
+                        img.state,
+                        crate::image_view::ImagePayloadState::Dehydrated
+                            | crate::image_view::ImagePayloadState::Decoding { .. }
+                    ),
+                    None => {
+                        ws.pane_view_ids(ws.active_pane_id())
+                            .is_some_and(|t| t.is_empty())
+                            && ws.visible_targets().next().is_some()
                     }
                     _ => false,
                 };
@@ -1159,7 +1197,9 @@ async fn run_full_scenario(
         |cx| {
             cx.update(|cx| {
                 let ws = workspace.read(cx);
-                matches!(ws.active_slot(), Some(TabSlot::Paged(pv)) if pv.current_slice.is_some())
+                ws.active_view_id()
+                    .and_then(|id| ws.paged_view(id))
+                    .is_some_and(|(_, vp)| vp.current_slice.is_some())
             })
         },
         "paged file first 64 KiB viewport load",
@@ -1217,7 +1257,9 @@ async fn run_full_scenario(
         |cx| {
             cx.update(|cx| {
                 let ws = workspace.read(cx);
-                matches!(ws.active_slot(), Some(TabSlot::Paged(pv)) if pv.visible_byte_range().start > 1_000_000)
+                ws.active_view_id()
+                    .and_then(|id| ws.paged_view(id))
+                    .is_some_and(|(_, vp)| vp.visible_byte_range().start > 1_000_000)
             })
         },
         "paged viewport jump beyond 1 MiB",
@@ -1643,6 +1685,57 @@ fn pump_frame(window_handle: &AnyWindowHandle, cx: &mut AsyncApp) -> Result<(), 
             window.draw(cx).clear(cx);
         })
         .map_err(|e| format!("pump_frame failed: {e}"))
+}
+
+async fn wait_until_with_frames(
+    timeout: Duration,
+    window_handle: &AnyWindowHandle,
+    cx: &mut AsyncApp,
+    mut predicate: impl FnMut(&mut AsyncApp) -> bool,
+    step_name: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        pump_frame(window_handle, cx)?;
+        if predicate(cx) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {step_name}"));
+        }
+        sleep_ms(20, cx).await;
+    }
+}
+
+fn dispatch_window_action<A: Action>(
+    window_handle: &AnyWindowHandle,
+    cx: &mut AsyncApp,
+    action: A,
+) -> Result<(), String> {
+    window_handle
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(action), cx);
+        })
+        .map_err(|e| format!("dispatch_window_action failed: {e}"))
+}
+
+fn focus_active_editor_or_workspace(
+    window_handle: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                if let Some(TabSlot::Editable(ed)) = ws.active_slot() {
+                    ed.focus(window, cx);
+                } else {
+                    ws.focus_handle.focus(window, cx);
+                }
+            });
+        })
+        .map_err(|e| format!("focus_active_editor_or_workspace failed: {e}"))?;
+    pump_frame(window_handle, cx)
 }
 
 fn dispatch_smoke_key(
@@ -2772,6 +2865,18 @@ async fn run_usability_scenario(
         return Err("columnar/multi-cursor verification flag not set".to_string());
     }
 
+    // =========================================================================
+    // 8. Lossless JSON & JSONC Tools + Single-Step Undo + Background Error Jump
+    // =========================================================================
+    verify_json_lossless_and_undo_native(window_handle, workspace, cx).await?;
+    report.json_lossless_and_undo_verified = true;
+
+    // =========================================================================
+    // 9. Bounded Raster Image Viewer Preview, Zoom, OverBudget, & Release
+    // =========================================================================
+    verify_image_viewer_native(window_handle, workspace, &work_dir, report, cx).await?;
+    report.image_viewer_budget_and_release_verified = true;
+
     pump_frame(window_handle, cx)?;
     cx.update(|cx| {
         capture_workspace_metrics(workspace.read(cx), report);
@@ -3174,4 +3279,731 @@ pub fn verify_post_shutdown_usability(data_dir: &Path, report: &SmokeReport) -> 
             .map_err(|e| e.to_string())
     });
     check_res.and(shutdown_res)
+}
+
+fn verify_lossless_json_tokens(text: &str, require_formatted: bool) -> Result<(), String> {
+    if require_formatted && (!text.contains('\n') || !text.contains("  \"dup\":")) {
+        return Err(format!(
+            "expected formatted multiline JSON/JSONC, got: {text:?}"
+        ));
+    }
+    let dup1 = text
+        .find("\"dup\"")
+        .ok_or_else(|| format!("missing first duplicate key in {text:?}"))?;
+    let dup2 = text[dup1 + 5..]
+        .find("\"dup\"")
+        .map(|rel| dup1 + 5 + rel)
+        .ok_or_else(|| format!("missing second duplicate key in {text:?}"))?;
+    if dup1 >= dup2 {
+        return Err("duplicate keys were not preserved in order".into());
+    }
+    for token in [
+        "900719925474099312345678901234567890",
+        "-0",
+        "1e+05",
+        r#""\u0041\n""#,
+        "\"中文🙂\"",
+    ] {
+        if !text.contains(token) {
+            return Err(format!("lossless token {token:?} missing from {text:?}"));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_json_lossless_and_undo_native(
+    window_handle: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let undo_key = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+
+    // Part A: JSONC input with trailing comma + line comment + J01 lossless tokens.
+    let jsonc_sample = "{\"arr\":[1,2,],\"dup\":1,\"dup\":2,\"big\":900719925474099312345678901234567890,\"negzero\":-0,\"exp\":1e+05,\"esc\":\"\\u0041\\n\",\"cjk\":\"中文🙂\"} // keep_comment\n";
+    let expected_err_offset = jsonc_sample
+        .find(",]")
+        .ok_or("missing trailing comma offset in JSONC fixture")?;
+
+    let jsonc_target = window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| -> Result<ViewTarget, String> {
+                let target = ws
+                    .create_untitled_tab(true, window, cx)
+                    .ok_or("missing untitled tab for JSONC test")?;
+                let ed = ws
+                    .active_editable_mut()
+                    .ok_or("JSONC untitled tab is not Editable")?;
+                let editor_entity = ed.editor().clone();
+                editor_entity.update(cx, |state, cx| {
+                    state.replace_text_in_range(None, jsonc_sample, window, cx);
+                    state.set_selected_range(0..0, cx);
+                    state.focus(window, cx);
+                });
+                Ok(target)
+            })
+        })
+        .map_err(|e| e.to_string())??;
+    pump_frame(window_handle, cx)?;
+    let rev_initial = cx.update(|cx| -> Result<Revision, String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(jsonc_target.view_id) else {
+            return Err("JSONC untitled tab lost Editable after insert".into());
+        };
+        if ed.has_pending_native_edit(cx) || ed.committed_rope().to_string() != jsonc_sample {
+            return Err("JSONC sample did not settle cleanly before ValidateJson".into());
+        }
+        Ok(ed.visible_revision)
+    })?;
+
+    // 1) Strict ValidateJson must reject trailing comma/comment without mutating the buffer and
+    // must jump the cursor to the exact syntax error byte offset.
+    dispatch_window_action(window_handle, cx, ValidateJson)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                matches!(
+                    ws.view_slot(jsonc_target.view_id),
+                    Some(TabSlot::Editable(ed)) if ed.editor().read(cx).cursor() == expected_err_offset
+                )
+            })
+        },
+        "background strict ValidateJson syntax error cursor jump",
+    )
+    .await?;
+
+    window_handle
+        .update(cx, |_, window, cx| -> Result<(), String> {
+            let ws = workspace.read(cx);
+            let Some(TabSlot::Editable(ed)) = ws.view_slot(jsonc_target.view_id) else {
+                return Err("JSONC tab missing after ValidateJson".into());
+            };
+            if ed.visible_revision != rev_initial || ed.committed_rope().to_string() != jsonc_sample
+            {
+                return Err("strict ValidateJson unexpectedly mutated JSONC buffer".into());
+            }
+            window.clear_notifications(cx);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())??;
+    pump_frame(window_handle, cx)?;
+
+    // 2) FormatJsonc must preserve comment, trailing comma, and all J01 lossless tokens in 1 step.
+    dispatch_window_action(window_handle, cx, FormatJsonc)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                matches!(
+                    ws.view_slot(jsonc_target.view_id),
+                    Some(TabSlot::Editable(ed))
+                        if ed.visible_revision == Revision(rev_initial.0 + 1)
+                            && !ed.has_pending_native_edit(cx)
+                )
+            })
+        },
+        "FormatJsonc background atomic edit",
+    )
+    .await?;
+
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(jsonc_target.view_id) else {
+            return Err("JSONC tab missing after FormatJsonc".into());
+        };
+        let formatted = ed.committed_rope().to_string();
+        if !formatted.contains("// keep_comment") {
+            return Err(format!("FormatJsonc dropped comment: {formatted:?}"));
+        }
+        verify_lossless_json_tokens(&formatted, true)?;
+        if !formatted.contains("\"dup\": 1") || !formatted.contains("\"dup\": 2") {
+            return Err(format!(
+                "FormatJsonc did not format duplicate keys: {formatted:?}"
+            ));
+        }
+        Ok(())
+    })?;
+
+    // 3) Single Undo must restore exact original unformatted JSONC text.
+    pump_frame(window_handle, cx)?;
+    dispatch_smoke_key(window_handle, cx, undo_key)?;
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(jsonc_target.view_id) else {
+            return Err("JSONC tab missing after Undo".into());
+        };
+        let committed = ed.committed_rope().to_string();
+        let native = ed.editor().read(cx).text().to_string();
+        if committed != jsonc_sample || native != jsonc_sample {
+            return Err(format!(
+                "single Undo after FormatJsonc did not restore exact text: {committed:?}"
+            ));
+        }
+        if ed.visible_revision != Revision(rev_initial.0 + 2) {
+            return Err(format!(
+                "single Undo after FormatJsonc did not advance revision by 1: got {}, expected {}",
+                ed.visible_revision.0,
+                rev_initial.0 + 2
+            ));
+        }
+        Ok(())
+    })?;
+
+    // Part B: Strict valid JSON -> ValidateJson -> FormatJson -> MinifyJson -> single Undo -> J02 durability.
+    let strict_sample = "{\"dup\":1,\"dup\":2,\"big\":900719925474099312345678901234567890,\"negzero\":-0,\"exp\":1e+05,\"esc\":\"\\u0041\\n\",\"cjk\":\"中文🙂\"}\n";
+    let strict_target = window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| -> Result<ViewTarget, String> {
+                ws.status_flash = None;
+                let target = ws
+                    .create_untitled_tab(true, window, cx)
+                    .ok_or("missing untitled tab for strict JSON test")?;
+                let ed = ws
+                    .active_editable_mut()
+                    .ok_or("strict JSON untitled tab is not Editable")?;
+                let editor_entity = ed.editor().clone();
+                editor_entity.update(cx, |state, cx| {
+                    state.replace_text_in_range(None, strict_sample, window, cx);
+                    state.set_selected_range(0..0, cx);
+                    state.focus(window, cx);
+                });
+                Ok(target)
+            })
+        })
+        .map_err(|e| e.to_string())??;
+    pump_frame(window_handle, cx)?;
+    let rev_strict_0 = cx.update(|cx| -> Result<Revision, String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(strict_target.view_id) else {
+            return Err("strict JSON untitled tab lost Editable after insert".into());
+        };
+        if ed.has_pending_native_edit(cx) || ed.committed_rope().to_string() != strict_sample {
+            return Err("strict JSON sample did not settle cleanly before ValidateJson".into());
+        }
+        Ok(ed.visible_revision)
+    })?;
+
+    dispatch_window_action(window_handle, cx, ValidateJson)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                workspace
+                    .read(cx)
+                    .status_flash
+                    .as_ref()
+                    .is_some_and(|(msg, _)| msg.starts_with("Valid JSON"))
+            })
+        },
+        "strict ValidateJson success status flash",
+    )
+    .await?;
+
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(strict_target.view_id) else {
+            return Err("strict JSON tab missing after ValidateJson".into());
+        };
+        if ed.visible_revision != rev_strict_0 || ed.editor().read(cx).cursor() != 0 {
+            return Err("valid ValidateJson altered revision or cursor unexpectedly".into());
+        }
+        Ok(())
+    })?;
+
+    dispatch_window_action(window_handle, cx, FormatJson)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                matches!(
+                    ws.view_slot(strict_target.view_id),
+                    Some(TabSlot::Editable(ed))
+                        if ed.visible_revision == Revision(rev_strict_0.0 + 1)
+                            && !ed.has_pending_native_edit(cx)
+                )
+            })
+        },
+        "FormatJson background atomic edit",
+    )
+    .await?;
+
+    let formatted_strict = cx.update(|cx| -> Result<String, String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(strict_target.view_id) else {
+            return Err("strict JSON tab missing after FormatJson".into());
+        };
+        let formatted = ed.committed_rope().to_string();
+        verify_lossless_json_tokens(&formatted, true)?;
+        Ok(formatted)
+    })?;
+
+    pump_frame(window_handle, cx)?;
+    dispatch_window_action(window_handle, cx, MinifyJson)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                matches!(
+                    ws.view_slot(strict_target.view_id),
+                    Some(TabSlot::Editable(ed))
+                        if ed.visible_revision == Revision(rev_strict_0.0 + 2)
+                            && !ed.has_pending_native_edit(cx)
+                )
+            })
+        },
+        "MinifyJson background atomic edit",
+    )
+    .await?;
+
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(strict_target.view_id) else {
+            return Err("strict JSON tab missing after MinifyJson".into());
+        };
+        let minified = ed.committed_rope().to_string();
+        if minified != strict_sample.trim_end_matches('\n') {
+            return Err(format!(
+                "MinifyJson did not produce expected compact JSON: {minified:?}"
+            ));
+        }
+        verify_lossless_json_tokens(&minified, false)?;
+        Ok(())
+    })?;
+
+    pump_frame(window_handle, cx)?;
+    dispatch_smoke_key(window_handle, cx, undo_key)?;
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Editable(ed)) = ws.view_slot(strict_target.view_id) else {
+            return Err("strict JSON tab missing after Undo".into());
+        };
+        let restored = ed.committed_rope().to_string();
+        if restored != formatted_strict || ed.visible_revision != Revision(rev_strict_0.0 + 3) {
+            return Err(format!(
+                "single Undo after MinifyJson did not restore formatted JSON: rev={} text={restored:?}",
+                ed.visible_revision.0
+            ));
+        }
+        Ok(())
+    })?;
+
+    wait_until(
+        Duration::from_secs(10),
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                matches!(
+                    ws.view_slot(strict_target.view_id),
+                    Some(TabSlot::Editable(ed))
+                        if ed.doc_id == strict_target.document.doc_id
+                            && ed.is_dirty()
+                            && ed.durable_revision >= ed.visible_revision
+                            && ed.durable_revision.0 > 0
+                            && !ed.has_pending_native_edit(cx)
+                )
+            })
+        },
+        "durable SQLite checkpoint after JSON/JSONC tools (J02)",
+    )
+    .await?;
+
+    Ok(())
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320u32 & mask);
+        }
+    }
+    !crc
+}
+
+fn zlib_adler32(bytes: &[u8]) -> u32 {
+    const MOD_ADLER: u32 = 65_521;
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for &b in bytes {
+        s1 = (s1 + b as u32) % MOD_ADLER;
+        s2 = (s2 + s1) % MOD_ADLER;
+    }
+    (s2 << 16) | s1
+}
+
+fn push_png_chunk(out: &mut Vec<u8>, chunk_type: [u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let crc_start = out.len();
+    out.extend_from_slice(&chunk_type);
+    out.extend_from_slice(data);
+    let crc = png_crc32(&out[crc_start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+fn build_png_ihdr_bytes(width: u32, height: u32) -> [u8; 13] {
+    let w = width.to_be_bytes();
+    let h = height.to_be_bytes();
+    [
+        w[0], w[1], w[2], w[3], h[0], h[1], h[2], h[3], 8, 6, 0, 0, 0,
+    ]
+}
+
+fn build_valid_rgba_png(width: u32, height: u32) -> Vec<u8> {
+    let mut raw = Vec::with_capacity((height as usize) * (1 + (width as usize) * 4));
+    for y in 0..height {
+        raw.push(0); // Filter type 0 (None)
+        for x in 0..width {
+            raw.push(((x * 63) & 0xff) as u8);
+            raw.push(((y * 63) & 0xff) as u8);
+            raw.push(180);
+            raw.push(255);
+        }
+    }
+    assert!(raw.len() <= u16::MAX as usize);
+    let len_le = (raw.len() as u16).to_le_bytes();
+    let nlen_le = (!(raw.len() as u16)).to_le_bytes();
+    let mut zlib = Vec::with_capacity(raw.len() + 11);
+    zlib.extend_from_slice(&[0x78, 0x01, 0x01]);
+    zlib.extend_from_slice(&len_le);
+    zlib.extend_from_slice(&nlen_le);
+    zlib.extend_from_slice(&raw);
+    zlib.extend_from_slice(&zlib_adler32(&raw).to_be_bytes());
+
+    let mut out = Vec::with_capacity(64 + zlib.len());
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    push_png_chunk(&mut out, *b"IHDR", &build_png_ihdr_bytes(width, height));
+    push_png_chunk(&mut out, *b"IDAT", &zlib);
+    push_png_chunk(&mut out, *b"IEND", &[]);
+    out
+}
+
+fn build_header_only_png(width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    push_png_chunk(&mut out, *b"IHDR", &build_png_ihdr_bytes(width, height));
+    push_png_chunk(
+        &mut out,
+        *b"IDAT",
+        &[
+            0x78, 0x01, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+        ],
+    );
+    push_png_chunk(&mut out, *b"IEND", &[]);
+    out
+}
+
+async fn verify_image_viewer_native(
+    window_handle: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    work_dir: &Path,
+    report: &mut SmokeReport,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let bomb_path = work_dir.join("bomb_20000x20000.png");
+    let valid_path = work_dir.join("valid_4x4.png");
+    std::fs::write(&bomb_path, build_header_only_png(20_000, 20_000))
+        .map_err(|e| format!("write bomb png: {e}"))?;
+    std::fs::write(&valid_path, build_valid_rgba_png(4, 4))
+        .map_err(|e| format!("write valid 4x4 png: {e}"))?;
+    let bomb_canonical = std::fs::canonicalize(&bomb_path).unwrap_or_else(|_| bomb_path.clone());
+    let valid_canonical = std::fs::canonicalize(&valid_path).unwrap_or_else(|_| valid_path.clone());
+
+    // 1) Open 20000x20000 decompression-bomb PNG header -> OverBudget with zero decoded pixels.
+    window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.open_path(bomb_path.clone(), window, cx);
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && matches!(
+                        ws.active_slot(),
+                        Some(TabSlot::Image(img))
+                            if img.meta.path.as_deref() == Some(bomb_canonical.as_path())
+                                && !matches!(
+                                    img.state,
+                                    ImagePayloadState::Dehydrated | ImagePayloadState::Decoding { .. }
+                                )
+                    )
+            })
+        },
+        "20000x20000 PNG OverBudget open",
+    )
+    .await?;
+
+    report
+        .expected_usability_mru_paths
+        .insert(0, bomb_canonical.clone());
+
+    let bomb_doc_id = cx.update(|cx| -> Result<DocumentId, String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Image(img)) = ws.active_slot() else {
+            return Err("20000x20000 PNG did not open as TabSlot::Image".into());
+        };
+        if img.format != RasterImageFormat::Png || img.width != 20_000 || img.height != 20_000 {
+            return Err(format!(
+                "unexpected 20000x20000 PNG header metadata: {:?} {}x{}",
+                img.format, img.width, img.height
+            ));
+        }
+        if !matches!(img.state, ImagePayloadState::OverBudget { .. })
+            || img.ready_decoded_bytes() != 0
+        {
+            return Err(format!(
+                "20000x20000 PNG was not rejected as OverBudget with 0 decoded bytes: ready_bytes={}",
+                img.ready_decoded_bytes()
+            ));
+        }
+        Ok(img.doc_id)
+    })?;
+
+    focus_active_editor_or_workspace(window_handle, workspace, cx)?;
+    dispatch_window_action(window_handle, cx, CloseActiveTab)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy() && !ws.documents.contains_key(&bomb_doc_id)
+            })
+        },
+        "closing OverBudget PNG tab",
+    )
+    .await?;
+
+    // 2) Open valid 4x4 RGBA PNG -> decode off-thread to Ready & render into GPUI frame.
+    window_handle
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.open_path(valid_path.clone(), window, cx);
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && matches!(
+                        ws.active_slot(),
+                        Some(TabSlot::Image(img))
+                            if img.meta.path.as_deref() == Some(valid_canonical.as_path())
+                                && matches!(img.state, ImagePayloadState::Ready { .. })
+                    )
+            })
+        },
+        "4x4 PNG decode completion",
+    )
+    .await?;
+
+    report
+        .expected_usability_mru_paths
+        .insert(0, valid_canonical.clone());
+
+    let (img_view_id, img_doc_id) = cx.update(
+        |cx| -> Result<(editor_services::ViewId, DocumentId), String> {
+            let ws = workspace.read(cx);
+            let view_id = ws
+                .active_view_id()
+                .ok_or("missing active 4x4 PNG view_id")?;
+            let Some((img, vp)) = ws.image_view(view_id) else {
+                return Err("4x4 PNG did not initialize image_viewports".into());
+            };
+            if img.format != RasterImageFormat::Png
+                || img.width != 4
+                || img.height != 4
+                || img.ready_decoded_bytes() != 4 * 4 * 4
+            {
+                return Err(format!(
+                    "4x4 PNG metadata/decoded mismatch: {:?} {}x{} bytes={}",
+                    img.format,
+                    img.width,
+                    img.height,
+                    img.ready_decoded_bytes()
+                ));
+            }
+            if vp.zoom != ImageZoomMode::Fit {
+                return Err(format!(
+                    "expected initial ImageZoomMode::Fit, got {:?}",
+                    vp.zoom
+                ));
+            }
+            Ok((view_id, img.doc_id))
+        },
+    )?;
+
+    focus_active_editor_or_workspace(window_handle, workspace, cx)?;
+
+    // 3) Zoom controls: ActualSize (100%) -> ZoomIn (125%) -> Fit.
+    let zoom_steps: &[(&str, fn() -> Box<dyn Action>, ImageZoomMode)] = &[
+        (
+            "ImageZoomActualSize",
+            || Box::new(ImageZoomActualSize),
+            ImageZoomMode::Percent(100),
+        ),
+        (
+            "ImageZoomIn",
+            || Box::new(ImageZoomIn),
+            ImageZoomMode::Percent(125),
+        ),
+        (
+            "ImageZoomFit",
+            || Box::new(ImageZoomFit),
+            ImageZoomMode::Fit,
+        ),
+    ];
+    for (label, make_action, expected_zoom) in zoom_steps {
+        window_handle
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(make_action(), cx);
+            })
+            .map_err(|e| format!("{label} dispatch failed: {e}"))?;
+        pump_frame(window_handle, cx)?;
+        cx.update(|cx| -> Result<(), String> {
+            let ws = workspace.read(cx);
+            let (_, vp) = ws
+                .image_view(img_view_id)
+                .ok_or("image viewport missing during zoom check")?;
+            if vp.zoom != *expected_zoom {
+                return Err(format!(
+                    "{label} expected zoom {expected_zoom:?}, got {:?}",
+                    vp.zoom
+                ));
+            }
+            Ok(())
+        })?;
+    }
+
+    // 4) Capture Weak<RenderImage>, close tab, pump frame, and assert immediate GPU release (I01).
+    let weak_img: Weak<RenderImage> = cx.update(|cx| -> Result<Weak<RenderImage>, String> {
+        let ws = workspace.read(cx);
+        let Some(TabSlot::Image(img)) = ws.view_slot(img_view_id) else {
+            return Err("4x4 image slot missing before close".into());
+        };
+        let ImagePayloadState::Ready {
+            ref render_image, ..
+        } = img.state
+        else {
+            return Err("4x4 image no longer Ready before close".into());
+        };
+        Ok(Arc::downgrade(render_image))
+    })?;
+
+    if weak_img.upgrade().is_none() {
+        return Err("Weak<RenderImage> was unexpectedly already dropped before tab close".into());
+    }
+
+    focus_active_editor_or_workspace(window_handle, workspace, cx)?;
+    dispatch_window_action(window_handle, cx, CloseActiveTab)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window_handle,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && !ws.session_layout().views.contains_key(&img_view_id)
+                    && !ws.documents.contains_key(&img_doc_id)
+                    && !ws.image_viewports.contains_key(&img_view_id)
+            })
+        },
+        "closing 4x4 PNG tab",
+    )
+    .await?;
+    pump_frame(window_handle, cx)?;
+
+    if weak_img.upgrade().is_some() {
+        return Err(
+            "Weak<RenderImage> still alive after closing image tab and pumping frame (I01 leak)"
+                .into(),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_4x4_and_header_only_20000_pngs_behave_as_expected() {
+        let valid = build_valid_rgba_png(4, 4);
+        let renderer = gpui_kit::SvgRenderer::new(Arc::new(()));
+        let cancel = CancelToken::new();
+        let img = crate::image_view::decode_render_image_off_thread(
+            gpui_kit::ImageFormat::Png,
+            Arc::from(valid.as_slice()),
+            renderer,
+            &cancel,
+        )
+        .expect("generated 4x4 PNG should decode");
+        assert_eq!(
+            img.size(0),
+            gpui_kit::size(gpui_kit::DevicePixels(4), gpui_kit::DevicePixels(4))
+        );
+        assert_eq!(crate::image_view::render_image_decoded_bytes(&img), 64);
+
+        let bomb = build_header_only_png(20_000, 20_000);
+        assert!(bomb.len() < 100);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bomb_path = dir.path().join("bomb.png");
+        std::fs::write(&bomb_path, &bomb).expect("write bomb");
+        let paging = editor_services::PagingService::default();
+        let outcome = editor_services::open_document(
+            DocumentId::new(),
+            &bomb_path,
+            &paging,
+            editor_services::OpenOptions::default(),
+            &cancel,
+        )
+        .expect("open bomb");
+        match outcome {
+            editor_services::OpenOutcome::Image(
+                editor_services::ImageOpenOutcome::OverBudget { info, .. },
+            ) => {
+                assert_eq!(info.format, RasterImageFormat::Png);
+                assert_eq!(info.width, 20_000);
+                assert_eq!(info.height, 20_000);
+            }
+            other => panic!("expected OverBudget image outcome, got {other:?}"),
+        }
+    }
 }

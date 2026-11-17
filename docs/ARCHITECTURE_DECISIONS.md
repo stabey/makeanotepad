@@ -209,6 +209,24 @@ ADR012后的已绘制启动采样与存活分配组显示两项直接浪费：�
 - **多帧Smoke Arena清理修复**：`apps/editor/src/smoke.rs`三处`pump_frame`/首帧循环原先以`let _ = window.draw(cx);`丢弃`ArenaClearNeeded`返回值，导致多帧渐进折行期间`cx.element_arena`无法跨帧回收；现已全部改为`window.draw(cx).clear(cx)`。
 - **受维护原生范围**：`vendor/gpui-base`受维护文件扩展为**6**个（`state.rs`、`undo_manager.rs`、`element.rs`、`display_map.rs`、`wrap_map.rs`、`text_wrapper.rs`），完整来源、用途与校验和集中记录在[`vendor/gpui-base/NOTICE-IME-PATCH.json`](../vendor/gpui-base/NOTICE-IME-PATCH.json)。
 
+## ADR 017：SQLite Schema v3、Layout Format v3 与主应用只读同文档多视口
+
+在保持 **Editable 同文档多视图仍为 NO-GO**（ADR 009）的前提下，将 SQLite 恢复库与布局快照升级到版本 3，把只读共享源多视口能力正式接入主应用（零新增 Cargo 依赖、`Cargo.lock` 不变）：
+
+- **SQLite `schema v3` 与原子 `v2 -> v3` 迁移**：`crates/editor-services/src/recovery_layout.rs` 将数据库 `user_version` 升至 `3`，在 `Immediate` 事务中原子重建 `layout_views` 表（移除 `UNIQUE(view_set, doc)` 约束，保留 `PRIMARY KEY(view_set, view_id)` 与非唯一 `layout_views_doc` 索引）。迁移继续受 `FaultPoint::RecoveryBeforeCommit` 回滚保护，写连接开启前仍执行严格的只读 `preflight` 检查以拒绝未知未来版本、表头或视图字段。
+- **`LAYOUT_FORMAT_VERSION = 3` 与兼容性**：`crates/editor-services/src/session_layout.rs` 提升 `LAYOUT_FORMAT_VERSION = 3`；读取 `v1`/`v2` 快照时在内存中升级为 `v3`（仅在正常布局写入时落盘新版本），对 `< 3` 的旧快照若存在重复 `doc_id` 视图行仍拒绝加载。`SessionLayout` 新增 `insert_shared_view`、`doc_view_count`、`views_for_doc`、`PaneCommand::SplitAndClone` 及 `SessionLayout::validate()` 多视图一致性校验。
+- **清单去重与 ADR 009 单视图折叠**：`read_manifest` 与 `catalog_summary` 按 `DocumentKey` 去重，避免共享源的多个视图重复计入 `documents` 清单或目录摘要；若恢复清单发现 `Editable` 或已有 checkpoint 草稿存在多个视图（例如旧测试数据或文件降级场景），按 ADR 009 折叠为单视图并记录 `RecoveryWarning`。
+- **主应用共享源与按 `ViewId` 隔离的视口状态**：`apps/editor` 将 `TabSlot::Paged` 改为持有共享 `PagedSourceState`、新增 `TabSlot::Image(ImageTabState)`，并由 `EditorWorkspace` 按 `ViewId` 维护 `paged_viewports: HashMap<ViewId, PagedViewportState>` 与 `image_viewports: HashMap<ViewId, ImageViewportState>`。新增 `SplitAndCloneActiveViewRight`（`cmd-alt-shift-l`/`ctrl-alt-shift-l`）、`SplitAndCloneActiveViewDown`（`cmd-alt-shift-j`/`ctrl-alt-shift-j`）与 `CloneActiveReadOnlyView`（`SplitPaneLeft` 保留 `cmd-alt-\`/`ctrl-alt-\`），共享同一个 `PagingService` 源及既定 64 MiB 页缓存 / 16 MiB 索引预算（增量索引仅向正在加载的可见视口让步）。
+- **次视图快速关闭 vs 末视图文档关闭与重载**：当同一 `doc_id` 仍保留至少 1 个视图时，`CloseActiveTab` 经 `remove_views` 执行次视图快速关闭——无确认弹窗、不 teardown 共享文档或分页源；`close_views` 显式拒绝在仍有次视图打开时传入 `CloseDisposition::Discard`。仅当关闭最后一个视图时才进入生命周期冻结并走 `CloseBatch`（记录 `closed_views` / `documents.state = 1`）。`ReloadActiveDocument` 在目标仍为只读分页或图像时同步重绑定该文档的全部共享视图，若磁盘缩减后转为 `Editable` 则按 ADR 009 折叠为单视图并丢弃多余视口。
+
+## ADR 018：Kit-Only 内置无损 JSON/JSONC 工具与有界只读光栅图像预览
+
+依据交接文档 §10.1 与 §14.4 回退路径，在 NSH TS/TSX 扩展宿主门槛未通过期间，于主应用内以纯 Rust 实现 **JSON/JSONC 工具（`T13`, `J01`, `J02`）** 与 **有界只读光栅图像预览（`T15`, `I01`）**，**零** `Cargo.toml` / `Cargo.lock` 依赖变动；同时明确不将其宣称为 JS 插件运行时或 `T12`/`T16` 扩展包交付：
+
+- **无损 RFC 8259 + JSONC 词法器与原子撤销事务（`apps/editor/src/json_tools.rs`）**：采用显式堆分配栈实现 `JsonDialect::{Json, Jsonc}` 校验、格式化与压缩（`MAX_JSON_TOOL_BYTES = 4 MiB`，`MAX_JSON_DEPTH = 2048`），不经由浮点或去重对象树反序列化，完整保留大整数、重复键与出现顺序、`-0`、指数表示、原始字符串转义、Unicode、末尾换行以及 JSONC 注释与尾随逗号（Minify JSONC 在 `//` 行注释后插入必需换行）。命令在后台线程执行：`Validate`/`Format`/`Minify` 遇 `JsonError::Syntax` 时在不改写正文的前提下跳转光标并提示行列位置；有效变换通过单个 UTF-8 与 CRLF 安全边界跨度经 `EditorAdapter` 原子应用（仅 `1` 次 `Undo` 撤销与 SQLite 持久恢复，应用前严格校验 `lifecycle_gen`、`visible_revision` 与无未决原生输入）。入口覆盖 `Tools` 菜单与命令面板（仅限可编辑文本槽位）。
+- **魔数 + 有界头探测预解码闸门（`crates/editor-services/src/image_probe.rs`）**：在读取完整文件体之前先按魔数（`matches_raster_magic`）与有界头读取（`<= 64 KiB` 前缀加有界 `read_at` 探测 JPEG 标记 / TIFF IFD / GIF 帧，支持 `PNG`、`JPEG`、`WebP`、`GIF`、`BMP`、`ICO`、`TIFF`）执行预算校验：单文件上限 `32 MiB`、宽高上限 `8192 px`、帧数上限 `128`、估算 RGBA 解码内存上限 `128 MiB`。超限返回 `ImageOpenOutcome::OverBudget` 且不读取完整图像体；损坏头安全回退为 `Paged` 查看器；`.svg` 继续作为可编辑 XML 文本打开而非光栅预览。
+- **工作区 LRU 缓存、GPU 纹理显式释放与每视图缩放（`apps/editor/src/image_view.rs`）**：全工作区 `Ready` 图像缓冲共享 `MAX_WORKSPACE_IMAGE_BYTES = 256 MiB` 上限，经 `plan_image_cache_eviction` 对非可见标签按最近激活顺序 LRU 驱逐（保留只读元数据以便再次激活时重解码）。图像经 `gpui_kit::Image::to_image_data` 离线程解码为 `RenderImage`，并在 LRU 驱逐、取消/过期完成、标签关闭、磁盘重载、清单替换与正常退出时显式调用 `cx.drop_image` 清理 GPUI `sprite_atlas` GPU 纹理。`ImageZoomMode`（`Fit` 与 `10%–800%` 阶梯）按 `ViewId` 持久化在 `ViewState`（`0` 表示 `Fit`，`10..=800` 表示百分比），支持同一图像在只读多视口中独立缩放（`ImageZoomIn` / `ImageZoomOut` / `ImageZoomActualSize` / `ImageZoomFit`）。
+
 ## 审查来源与证据边界
 
 本轮由项目 `design-review` 评审并修订上述契约。其最初误将 macOS 描述为虚拟机，已纠正；最初建议 per-key Rope equality 与 checkpoint-only 的潜在性能风险也已明确排除。评审结论只许可实施；构建、数据可靠性及性能结论见实际验证记录。

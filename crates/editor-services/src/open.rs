@@ -1,6 +1,7 @@
 use crate::{
-    CancelToken, ContentIdentity, DocumentId, EncodingSpec, ErrorKind, FileFingerprint, LineEnding,
-    PagedDocHandle, PagingService, ReadOnlyReason, ServiceError, SourceGeneration,
+    CancelToken, ContentIdentity, DocumentId, EncodingSpec, ErrorKind, FileFingerprint,
+    ImageOpenOutcome, LineEnding, PagedDocHandle, PagingService, ReadOnlyReason, ServiceError,
+    SourceGeneration, image_probe,
 };
 use ropey::{Rope, RopeBuilder};
 use std::path::Path;
@@ -36,6 +37,7 @@ pub enum OpenOutcome {
         fingerprint: FileFingerprint,
         source_gen: SourceGeneration,
     },
+    Image(ImageOpenOutcome),
 }
 #[derive(Default)]
 struct EolScan {
@@ -100,6 +102,7 @@ impl EolScan {
 fn set_reason(reason: &mut Option<ReadOnlyReason>, candidate: ReadOnlyReason) {
     fn priority(reason: &ReadOnlyReason) -> u8 {
         match reason {
+            ReadOnlyReason::ImagePreview => 5,
             ReadOnlyReason::BinaryContent => 4,
             ReadOnlyReason::UnsupportedEncoding => 3,
             ReadOnlyReason::LargeFile => 2,
@@ -159,6 +162,17 @@ pub fn open_document(
         let n = doc.read_at(offset, &mut bytes, source_gen)?;
         let mut chunk = &bytes[..n];
         if offset == 0 {
+            if image_probe::matches_raster_magic(chunk)
+                && let Some(img_outcome) = image_probe::open_raster_from_paged_doc(
+                    &doc,
+                    source_gen,
+                    fingerprint.clone(),
+                    cancel,
+                )?
+            {
+                doc.validate(source_gen)?;
+                return Ok(OpenOutcome::Image(img_outcome));
+            }
             if chunk.starts_with(&[0xef, 0xbb, 0xbf]) {
                 encoding = EncodingSpec::Utf8Bom;
                 chunk = &chunk[3..];

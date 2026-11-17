@@ -33,7 +33,7 @@ use crate::actions::{
     ToggleShowWhitespace, ToggleSidebar, ToggleSoftWrap, ToggleThemeMode, WORKSPACE_CONTEXT,
     action_for_language_id,
 };
-use crate::app::{EditorWorkspace, TabSlot};
+use crate::app::{EditorWorkspace, ImageZoomAction, TabSlot};
 use crate::group_ui::pane_ui::{
     PanePaletteAction, SPLIT_DIVIDER_THICKNESS_PX, build_pane_options_menu,
     can_split_pane_in_bounds, pane_elem_id, should_use_compact_layout, split_elem_id,
@@ -43,8 +43,9 @@ use crate::group_ui::{
     build_group_menu, build_tab_context_menu, group_color_hsla, group_elem_id, next_group_anchor,
     next_view_anchor_in_group, prev_group_anchor, prev_view_anchor_in_group, view_elem_id,
 };
+use crate::image_view::{ImagePayloadState, ImageTabState};
 use crate::language::{SUPPORTED_LANGUAGES, comment_prefix_for_language, detect_language};
-use crate::paged_view::{PagedTabState, format_bytes};
+use crate::paged_view::{PagedSourceState, PagedViewportState, format_bytes};
 use crate::search_bar::{SearchQueryKind, SearchStatus};
 use crate::shell::{
     PaletteCommandTarget, PaletteMode, disambiguate_paths, disambiguate_single_path_iter,
@@ -183,6 +184,19 @@ impl Render for EditorWorkspace {
             .on_action(cx.listener(Self::on_toggle_focus_active_pane))
             .on_action(cx.listener(Self::on_close_active_pane))
             .on_action(cx.listener(Self::on_close_active_pane_tabs))
+            .on_action(cx.listener(Self::on_split_and_clone_active_view_right))
+            .on_action(cx.listener(Self::on_split_and_clone_active_view_down))
+            .on_action(cx.listener(Self::on_clone_active_readonly_view))
+            .on_action(cx.listener(Self::on_format_json))
+            .on_action(cx.listener(Self::on_minify_json))
+            .on_action(cx.listener(Self::on_validate_json))
+            .on_action(cx.listener(Self::on_format_jsonc))
+            .on_action(cx.listener(Self::on_minify_jsonc))
+            .on_action(cx.listener(Self::on_validate_jsonc))
+            .on_action(cx.listener(Self::on_image_zoom_in))
+            .on_action(cx.listener(Self::on_image_zoom_out))
+            .on_action(cx.listener(Self::on_image_zoom_actual_size))
+            .on_action(cx.listener(Self::on_image_zoom_fit))
             .child(header)
             .children(banners)
             .when_some(goto_bar, |el, bar| el.child(bar))
@@ -800,8 +814,8 @@ impl EditorWorkspace {
             }
         }
 
-        if let (Some(target), Some(TabSlot::Paged(pv))) = (active_target, active_slot)
-            && let Some(src_err) = &pv.source_error
+        if let (Some(target), Some(TabSlot::Paged(src))) = (active_target, active_slot)
+            && let Some(src_err) = &src.source_error
         {
             out.push(
                 h_flex()
@@ -2229,8 +2243,27 @@ impl EditorWorkspace {
                     })
                     .into_any_element()
             }
-            (Some(target), Some(TabSlot::Paged(pv))) => {
-                self.render_paged_tab(pane_id, target, pv, cx)
+            (Some(target), Some(TabSlot::Paged(_))) => {
+                if let Some((src, vp)) = self.paged_view(target.view_id) {
+                    self.render_paged_tab(pane_id, target, src, vp, cx)
+                } else {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .p_4()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Preparing paged viewport…")
+                        .into_any_element()
+                }
+            }
+            (Some(target), Some(TabSlot::Image(img))) => {
+                let vp = self
+                    .image_view(target.view_id)
+                    .map(|(_, vp)| *vp)
+                    .unwrap_or_default();
+                self.render_image_tab(pane_id, target, img, vp, cx)
             }
             (_, Some(TabSlot::Hydrating { stub, .. })) => v_flex()
                 .size_full()
@@ -2801,18 +2834,27 @@ impl EditorWorkspace {
         &self,
         pane_id: PaneId,
         target: ViewTarget,
-        pv: &PagedTabState,
+        src: &PagedSourceState,
+        vp: &PagedViewportState,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let range = pv.visible_byte_range();
-        let total = pv.total_bytes();
+        let range = vp.visible_byte_range();
+        let total = src.total_bytes();
         let at_start = range.start == 0;
         let at_end = range.end >= total;
-        let prev_anchor = editor_services::ViewportAnchor::ByteOffset(pv.prev_page_offset());
-        let next_anchor = editor_services::ViewportAnchor::ByteOffset(pv.next_page_offset());
-        let end_anchor = editor_services::ViewportAnchor::ByteOffset(pv.end_page_offset());
+        let prev_anchor = editor_services::ViewportAnchor::ByteOffset(vp.prev_page_offset());
+        let next_anchor = editor_services::ViewportAnchor::ByteOffset(vp.next_page_offset(total));
+        let end_anchor = editor_services::ViewportAnchor::ByteOffset(src.end_page_offset());
 
-        let index_badge = match pv.index_status {
+        let doc_views = self.session_layout().views_for_doc(src.doc_id);
+        let view_total = doc_views.len();
+        let view_ordinal = doc_views
+            .iter()
+            .position(|v| v.view_id == target.view_id)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+
+        let index_badge = match src.index_status {
             IndexStatus::Indexing {
                 indexed_bytes,
                 total_bytes,
@@ -2830,8 +2872,8 @@ impl EditorWorkspace {
             }
         };
 
-        let is_lossy = pv.current_slice.as_ref().is_some_and(|s| s.lossy);
-        let is_fragment = pv
+        let is_lossy = vp.current_slice.as_ref().is_some_and(|s| s.lossy);
+        let is_fragment = vp
             .current_slice
             .as_ref()
             .is_some_and(|s| s.is_line_fragment);
@@ -2858,9 +2900,23 @@ impl EditorWorkspace {
                     .font_medium()
                     .child(format!(
                         "PAGED READ-ONLY ({})",
-                        format_readonly_reason(&pv.readonly_reason)
+                        format_readonly_reason(&src.readonly_reason)
                     )),
             )
+            .when(view_total > 1, |el| {
+                el.child(
+                    div()
+                        .id(pane_elem_id(*b"pgmv", pane_id))
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(3.))
+                        .bg(cx.theme().primary.opacity(0.16))
+                        .text_color(cx.theme().foreground)
+                        .text_xs()
+                        .font_medium()
+                        .child(format!("View {view_ordinal}/{view_total}")),
+                )
+            })
             .child(
                 Button::new(pane_elem_id(*b"pgst", pane_id))
                     .accessibility_id(format!("btn-paged-start-{}", pane_id.key()))
@@ -2919,8 +2975,29 @@ impl EditorWorkspace {
                     .xsmall()
                     .icon(IconName::Copy)
                     .label("Copy Slice")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.active_view_id() != Some(target.view_id) {
+                            this.activate_view(target, window, cx);
+                        }
                         this.copy_paged_slice(cx);
+                    })),
+            )
+            .child(
+                Button::new(pane_elem_id(*b"pgsp", pane_id))
+                    .accessibility_id(format!("btn-paged-split-view-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::PanelRight)
+                    .label("Split View")
+                    .tooltip("Split Right (New Read-Only View)")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.split_and_clone_view(
+                            pane_id,
+                            target,
+                            SplitDirection::Right,
+                            window,
+                            cx,
+                        );
                     })),
             )
             .child(
@@ -2963,16 +3040,17 @@ impl EditorWorkspace {
                         range.start,
                         range.end,
                         format_bytes(total),
-                        pv.source_gen.0
+                        src.source_gen.0
                     )),
             );
 
         let mono = cx.theme().mono_font_family.clone();
-        let scroll_handle = pv.scroll_handle.clone();
-        let item_sizes = pv.segment_item_sizes.clone();
+        let scroll_handle = vp.scroll_handle.clone();
+        let item_sizes = vp.segment_item_sizes.clone();
 
-        let viewport_body = if let Some(err) = &pv.source_error
-            && pv.current_slice.is_none()
+        let viewport_body = if let Some(err) =
+            vp.viewport_error.as_ref().or(src.source_error.as_ref())
+            && vp.current_slice.is_none()
         {
             div()
                 .flex_1()
@@ -2984,10 +3062,10 @@ impl EditorWorkspace {
                 .text_color(cx.theme().danger)
                 .child(format!("Viewport read error: {err}"))
                 .into_any_element()
-        } else if pv.current_slice.is_some() {
+        } else if vp.current_slice.is_some() {
             let entity = cx.entity();
             let prev_banner = (!at_start).then(|| {
-                let prev_a = editor_services::ViewportAnchor::ByteOffset(pv.prev_page_offset());
+                let prev_a = editor_services::ViewportAnchor::ByteOffset(vp.prev_page_offset());
                 div()
                     .id(pane_elem_id(*b"pgip", pane_id))
                     .w_full()
@@ -3008,7 +3086,8 @@ impl EditorWorkspace {
                     ))
             });
             let next_banner = (!at_end).then(|| {
-                let next_a = editor_services::ViewportAnchor::ByteOffset(pv.next_page_offset());
+                let next_a =
+                    editor_services::ViewportAnchor::ByteOffset(vp.next_page_offset(total));
                 div()
                     .id(pane_elem_id(*b"pgin", pane_id))
                     .w_full()
@@ -3038,19 +3117,19 @@ impl EditorWorkspace {
                     if this.session_layout().resolve(target).is_err() {
                         return Vec::new();
                     }
-                    let Some(TabSlot::Paged(pv_now)) = this.view_slot(target.view_id) else {
+                    let Some((_, vp_now)) = this.paged_view(target.view_id) else {
                         return Vec::new();
                     };
-                    let Some(slice_now) = &pv_now.current_slice else {
+                    let Some(slice_now) = &vp_now.current_slice else {
                         return Vec::new();
                     };
                     let slice_text: &str = &slice_now.text;
-                    let active_match_range = pv_now.highlighted_byte_range.clone();
+                    let active_match_range = vp_now.highlighted_byte_range.clone();
                     let row_mono = mono.clone();
 
                     visible_range
                         .filter_map(|seg_ix| {
-                            let seg = pv_now.cached_segments.get(seg_ix)?;
+                            let seg = vp_now.cached_segments.get(seg_ix)?;
                             let seg_str = slice_text.get(seg.text_range.clone()).unwrap_or("");
                             let gutter_label = match &seg.exact_file_byte_range {
                                 Some(exact) if seg.is_continuation => {
@@ -3160,6 +3239,334 @@ impl EditorWorkspace {
             .size_full()
             .child(nav_bar)
             .child(viewport_body)
+            .into_any_element()
+    }
+
+    fn render_image_tab(
+        &self,
+        pane_id: PaneId,
+        target: ViewTarget,
+        img: &ImageTabState,
+        vp: crate::image_view::ImageViewportState,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let (avail_w, avail_h) = self
+            .observed_pane_body_bounds(pane_id)
+            .map(|b| {
+                let w = f32::from(b.size.width).max(120.0);
+                let h = (f32::from(b.size.height) - 36.0).max(120.0);
+                (w, h)
+            })
+            .unwrap_or((800.0, 600.0));
+        let (disp_w, disp_h, effective_pct) = vp
+            .zoom
+            .compute_display_size(img.width, img.height, avail_w, avail_h);
+
+        let doc_views = self.session_layout().views_for_doc(img.doc_id);
+        let view_total = doc_views.len();
+        let view_ordinal = doc_views
+            .iter()
+            .position(|v| v.view_id == target.view_id)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+
+        let frames_suffix = if img.frames > 1 {
+            format!(" · {} frames", img.frames)
+        } else {
+            String::new()
+        };
+        let gpu_suffix = match &img.state {
+            ImagePayloadState::Ready { decoded_bytes, .. } => {
+                format!(" · GPU {}", format_bytes(*decoded_bytes))
+            }
+            _ => String::new(),
+        };
+        let zoom_badge = if matches!(vp.zoom, crate::image_view::ImageZoomMode::Fit) {
+            format!("Fit ({effective_pct}%)")
+        } else {
+            vp.zoom.label()
+        };
+
+        let toolbar = h_flex()
+            .id(pane_elem_id(*b"imtb", pane_id))
+            .w_full()
+            .px_3()
+            .py_1()
+            .gap_1p5()
+            .items_center()
+            .flex_shrink_0()
+            .bg(cx.theme().secondary.opacity(0.35))
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(px(3.))
+                    .bg(cx.theme().info.opacity(0.18))
+                    .text_color(cx.theme().foreground)
+                    .text_xs()
+                    .font_medium()
+                    .child("IMAGE PREVIEW"),
+            )
+            .when(view_total > 1, |el| {
+                el.child(
+                    div()
+                        .id(pane_elem_id(*b"immv", pane_id))
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(3.))
+                        .bg(cx.theme().primary.opacity(0.16))
+                        .text_color(cx.theme().foreground)
+                        .text_xs()
+                        .font_medium()
+                        .child(format!("View {view_ordinal}/{view_total}")),
+                )
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().foreground)
+                    .child(format!(
+                        "{} · {}×{}{}",
+                        img.format_label(),
+                        img.width,
+                        img.height,
+                        frames_suffix
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("· {}{}", format_bytes(img.file_bytes), gpu_suffix)),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new(pane_elem_id(*b"imzo", pane_id))
+                    .accessibility_id(format!("btn-image-zoom-out-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Minus)
+                    .tooltip("Zoom Out")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.zoom_image_view(pane_id, target.view_id, ImageZoomAction::Out, cx);
+                    })),
+            )
+            .child(
+                Button::new(pane_elem_id(*b"imz1", pane_id))
+                    .accessibility_id(format!("btn-image-zoom-100-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .label("100%")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.zoom_image_view(
+                            pane_id,
+                            target.view_id,
+                            ImageZoomAction::ActualSize,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                Button::new(pane_elem_id(*b"imzi", pane_id))
+                    .accessibility_id(format!("btn-image-zoom-in-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .tooltip("Zoom In")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.zoom_image_view(pane_id, target.view_id, ImageZoomAction::In, cx);
+                    })),
+            )
+            .child(
+                Button::new(pane_elem_id(*b"imzf", pane_id))
+                    .accessibility_id(format!("btn-image-zoom-fit-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .label("Fit")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.zoom_image_view(pane_id, target.view_id, ImageZoomAction::Fit, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .px_1p5()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(zoom_badge),
+            )
+            .child(
+                Button::new(pane_elem_id(*b"imsp", pane_id))
+                    .accessibility_id(format!("btn-image-split-view-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::PanelRight)
+                    .label("Split View")
+                    .tooltip("Split Right (New Read-Only View)")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.split_and_clone_view(
+                            pane_id,
+                            target,
+                            SplitDirection::Right,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                Button::new(pane_elem_id(*b"imrl", pane_id))
+                    .accessibility_id(format!("btn-image-reload-{}", pane_id.key()))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::RefreshCw)
+                    .tooltip("Reload Image")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.request_reload_view(target, window, cx);
+                    })),
+            );
+
+        let body = match &img.state {
+            ImagePayloadState::Ready { render_image, .. } => div()
+                .id(pane_elem_id(*b"imcv", pane_id))
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_scroll()
+                .flex()
+                .flex_col()
+                .p_4()
+                .child(
+                    div().m_auto().flex_shrink_0().child(
+                        gpui_kit::img(std::sync::Arc::clone(render_image))
+                            .w(px(disp_w))
+                            .h(px(disp_h)),
+                    ),
+                )
+                .into_any_element(),
+            ImagePayloadState::Decoding { .. } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_6()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child("Decoding image preview…"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} · {}×{} px · {}",
+                            img.format_label(),
+                            img.width,
+                            img.height,
+                            format_bytes(img.file_bytes)
+                        )),
+                )
+                .into_any_element(),
+            ImagePayloadState::Dehydrated => v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_6()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Image GPU texture evicted while inactive."),
+                )
+                .child(
+                    Button::new(pane_elem_id(*b"imhd", pane_id))
+                        .primary()
+                        .small()
+                        .label("Reload Preview")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.hydrate_visible_panes(window, cx);
+                        })),
+                )
+                .into_any_element(),
+            ImagePayloadState::OverBudget { reason } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_6()
+                .child(
+                    div()
+                        .text_base()
+                        .font_semibold()
+                        .child("Image Preview Over Budget"),
+                )
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(reason.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} · {}×{} px · {}",
+                            img.format_label(),
+                            img.width,
+                            img.height,
+                            format_bytes(img.file_bytes)
+                        )),
+                )
+                .into_any_element(),
+            ImagePayloadState::Failed { error } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_6()
+                .child(
+                    div()
+                        .text_base()
+                        .font_semibold()
+                        .text_color(cx.theme().danger)
+                        .child("Failed to Decode Image"),
+                )
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(error.clone()),
+                )
+                .child(
+                    Button::new(pane_elem_id(*b"imrf", pane_id))
+                        .primary()
+                        .small()
+                        .label("Reload from Disk")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.request_reload_view(target, window, cx);
+                        })),
+                )
+                .into_any_element(),
+        };
+
+        v_flex()
+            .size_full()
+            .child(toolbar)
+            .child(body)
             .into_any_element()
     }
 
@@ -4060,6 +4467,112 @@ impl EditorWorkspace {
                     groups.push((view_group, view_targets));
                 }
 
+                // 3b. Image Preview Zoom
+                let has_image = matches!(origin_slot, Some(TabSlot::Image(_)));
+                let mut img_group = CommandGroup::new().label("Image Preview");
+                let mut img_targets = Vec::new();
+                push_cmd(
+                    &mut img_group,
+                    &mut img_targets,
+                    "Image: Zoom In".into(),
+                    &["image", "zoom in", "magnify"],
+                    false,
+                    !has_image,
+                    PaletteCommandTarget::ImageZoomIn,
+                );
+                push_cmd(
+                    &mut img_group,
+                    &mut img_targets,
+                    "Image: Zoom Out".into(),
+                    &["image", "zoom out", "shrink"],
+                    false,
+                    !has_image,
+                    PaletteCommandTarget::ImageZoomOut,
+                );
+                push_cmd(
+                    &mut img_group,
+                    &mut img_targets,
+                    "Image: Zoom Actual Size (100%)".into(),
+                    &["image", "zoom", "100%", "actual size"],
+                    false,
+                    !has_image,
+                    PaletteCommandTarget::ImageZoomActualSize,
+                );
+                push_cmd(
+                    &mut img_group,
+                    &mut img_targets,
+                    "Image: Fit to Pane".into(),
+                    &["image", "zoom", "fit"],
+                    false,
+                    !has_image,
+                    PaletteCommandTarget::ImageZoomFit,
+                );
+                if !img_targets.is_empty() {
+                    groups.push((img_group, img_targets));
+                }
+
+                // 3c. Tools: JSON & JSONC
+                let mut tools_group = CommandGroup::new().label("Tools: JSON & JSONC");
+                let mut tools_targets = Vec::new();
+                let json_validate_disabled = lifecycle_busy || active_ed.is_none();
+                push_cmd(
+                    &mut tools_group,
+                    &mut tools_targets,
+                    "Tools: Format JSON".into(),
+                    &["json", "format", "pretty"],
+                    false,
+                    !can_edit,
+                    PaletteCommandTarget::FormatJson,
+                );
+                push_cmd(
+                    &mut tools_group,
+                    &mut tools_targets,
+                    "Tools: Minify JSON".into(),
+                    &["json", "minify", "compact"],
+                    false,
+                    !can_edit,
+                    PaletteCommandTarget::MinifyJson,
+                );
+                push_cmd(
+                    &mut tools_group,
+                    &mut tools_targets,
+                    "Tools: Validate JSON".into(),
+                    &["json", "validate", "lint", "check"],
+                    false,
+                    json_validate_disabled,
+                    PaletteCommandTarget::ValidateJson,
+                );
+                push_cmd(
+                    &mut tools_group,
+                    &mut tools_targets,
+                    "Tools: Format JSONC".into(),
+                    &["jsonc", "format", "comments", "trailing"],
+                    false,
+                    !can_edit,
+                    PaletteCommandTarget::FormatJsonc,
+                );
+                push_cmd(
+                    &mut tools_group,
+                    &mut tools_targets,
+                    "Tools: Minify JSONC (Strip Comments)".into(),
+                    &["jsonc", "minify", "strip comments"],
+                    false,
+                    !can_edit,
+                    PaletteCommandTarget::MinifyJsonc,
+                );
+                push_cmd(
+                    &mut tools_group,
+                    &mut tools_targets,
+                    "Tools: Validate JSONC".into(),
+                    &["jsonc", "validate", "comments", "lint"],
+                    false,
+                    json_validate_disabled,
+                    PaletteCommandTarget::ValidateJsonc,
+                );
+                if !tools_targets.is_empty() {
+                    groups.push((tools_group, tools_targets));
+                }
+
                 // 4. Format & Syntax Language
                 let mut fmt_group = CommandGroup::new().label("Format & Syntax Language");
                 let mut fmt_targets = Vec::new();
@@ -4466,6 +4979,36 @@ impl EditorWorkspace {
                             },
                         )),
                     );
+                    let can_clone_readonly = !lifecycle_busy
+                        && matches!(origin_slot, Some(TabSlot::Paged(_) | TabSlot::Image(_)))
+                        && self.session_layout().views.len() < editor_services::MAX_SESSION_VIEWS;
+                    push_cmd(
+                        &mut pane_section,
+                        &mut pane_targets,
+                        "Pane: Split Right (New Read-Only View)  (⇧⌥⌘L)".into(),
+                        &["pane", "split", "clone", "read-only", "view"],
+                        false,
+                        !can_clone_readonly || !ok_split_h,
+                        PaletteCommandTarget::SplitAndCloneActiveViewRight,
+                    );
+                    push_cmd(
+                        &mut pane_section,
+                        &mut pane_targets,
+                        "Pane: Split Down (New Read-Only View)  (⇧⌥⌘J)".into(),
+                        &["pane", "split", "clone", "read-only", "view"],
+                        false,
+                        !can_clone_readonly || !ok_split_v,
+                        PaletteCommandTarget::SplitAndCloneActiveViewDown,
+                    );
+                    push_cmd(
+                        &mut pane_section,
+                        &mut pane_targets,
+                        "Pane: Duplicate Read-Only View in Pane".into(),
+                        &["clone", "duplicate", "read-only", "view"],
+                        false,
+                        !can_clone_readonly,
+                        PaletteCommandTarget::CloneActiveReadOnlyView,
+                    );
                     for &(pnum, pid, _) in &pane_entries {
                         if pid != src_pane {
                             push_cmd(
@@ -4809,27 +5352,70 @@ impl EditorWorkspace {
                         format_encoding(ed.meta.encoding),
                     )
                 }
-                Some(TabSlot::Paged(pv)) => {
-                    cur_eol = pv.meta.line_ending;
-                    cur_enc = pv.meta.encoding;
-                    let range = pv.visible_byte_range();
+                Some(TabSlot::Paged(src)) => {
+                    cur_eol = src.meta.line_ending;
+                    cur_enc = src.meta.encoding;
+                    let range = self
+                        .active_view_id()
+                        .and_then(|id| self.paged_viewports.get(&id))
+                        .map(PagedViewportState::visible_byte_range)
+                        .unwrap_or(0..0);
                     (
                         "PAGED",
-                        pv.meta
+                        src.meta
                             .path
                             .as_deref()
                             .map(display_path_string)
                             .unwrap_or_default(),
-                        format!("gen {}", pv.source_gen.0),
+                        format!("gen {}", src.source_gen.0),
                         format!(
                             "0x{:X}..0x{:X} / {}",
                             range.start,
                             range.end,
-                            format_bytes(pv.total_bytes())
+                            format_bytes(src.total_bytes())
                         ),
                         "Paged Stream",
-                        format_eol(pv.meta.line_ending),
-                        format_encoding(pv.meta.encoding),
+                        format_eol(src.meta.line_ending),
+                        format_encoding(src.meta.encoding),
+                    )
+                }
+                Some(TabSlot::Image(img)) => {
+                    cur_eol = img.meta.line_ending;
+                    cur_enc = img.meta.encoding;
+                    let vp = self
+                        .active_view_id()
+                        .and_then(|id| self.image_viewports.get(&id))
+                        .copied()
+                        .unwrap_or_default();
+                    let (avail_w, avail_h) = self
+                        .observed_pane_body_bounds(self.active_pane_id())
+                        .map(|b| {
+                            let w = f32::from(b.size.width).max(120.0);
+                            let h = (f32::from(b.size.height) - 36.0).max(120.0);
+                            (w, h)
+                        })
+                        .unwrap_or((800.0, 600.0));
+                    let (_, _, zoom_pct) = vp
+                        .zoom
+                        .compute_display_size(img.width, img.height, avail_w, avail_h);
+                    (
+                        "IMAGE",
+                        img.meta
+                            .path
+                            .as_deref()
+                            .map(display_path_string)
+                            .unwrap_or_default(),
+                        img.format_label().to_string(),
+                        format!(
+                            "{}×{} px · {}% · {}",
+                            img.width,
+                            img.height,
+                            zoom_pct,
+                            format_bytes(img.file_bytes)
+                        ),
+                        img.format_label(),
+                        format_eol(img.meta.line_ending),
+                        format_encoding(img.meta.encoding),
                     )
                 }
                 Some(slot) => {
@@ -5151,5 +5737,6 @@ fn format_readonly_reason(reason: &ReadOnlyReason) -> &'static str {
         ReadOnlyReason::BinaryContent => "Binary / NUL Bytes",
         ReadOnlyReason::LongLine => "Line > 1 MiB",
         ReadOnlyReason::LargeFile => "Large File > Limit",
+        ReadOnlyReason::ImagePreview => "Image Preview",
     }
 }

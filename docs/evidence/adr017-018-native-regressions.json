@@ -1,0 +1,320 @@
+{
+  "schema_version": 1,
+  "platform": "macOS ARM64",
+  "scope": "ADR 017 (schema v3 / layout format v3 / read-only same-document multi-viewport) + ADR 018 (lossless JSON/JSONC tools + bounded raster image viewer) + Wave 0 CI 44015994062",
+  "wave_0_ci": {
+    "commit_sha": "91c301c86d9bbaaacfc334e68e95072647107497",
+    "files_committed": 25,
+    "workflow": "Native CI",
+    "run_id": 44015994062,
+    "run_url": "https://github.com/stabey/makeanotepad/actions/runs/44015994062",
+    "status": "completed",
+    "conclusion": "success",
+    "jobs_total": 6,
+    "jobs_passed": 6,
+    "jobs": [
+      {
+        "name": "fmt",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "aarch64-apple-darwin",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "x86_64-apple-darwin",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "x86_64-pc-windows-msvc",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "aarch64-pc-windows-msvc",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "x86_64-unknown-linux-gnu",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ],
+    "notes": "Wave 0 verified ADR 015/016 across all 6 jobs including Windows PE GUI/CUI subsystem validation; ADR 017/018 local changes verified post-#51 on macOS ARM64 and pending next CI push."
+  },
+  "cargo_lock_diff_empty": true,
+  "cargo_fmt_check_passed": true,
+  "spikes_multiview_paged_fmt_check_passed": true,
+  "binary_sha256": {
+    "target_release_editor": "0eda21fe48255d1c785f923f37fc7d72d152f258f5b57337911aedac03d9ad34",
+    "target_release_editor_services": "6ba1fde7ad0dee18d9f56d8cc4de2ec92b69ea123972e17449a78a1d1d2a400a",
+    "release_build_elapsed_s": 32.98
+  },
+  "unit_and_packaging_tests": {
+    "python_package_artifact_unittest": {
+      "passed": 9,
+      "failed": 0,
+      "elapsed_s": 0.01
+    },
+    "cargo_test_workspace": {
+      "command": "cargo test --locked --workspace",
+      "editor_lib": {
+        "passed": 82,
+        "failed": 0,
+        "elapsed_s": 0.38
+      },
+      "editor_bin": {
+        "passed": 0,
+        "failed": 0
+      },
+      "editor_services_lib": {
+        "passed": 27,
+        "failed": 0,
+        "elapsed_s": 0.56
+      },
+      "editor_services_bin": {
+        "passed": 0,
+        "failed": 0
+      },
+      "editor_services_integration": {
+        "passed": 86,
+        "failed": 0,
+        "elapsed_s": 10.5
+      },
+      "doc_tests": {
+        "passed": 0,
+        "failed": 0
+      },
+      "total_passed": 195,
+      "total_failed": 0,
+      "total_ignored": 0
+    },
+    "gpui_base_private_tests": {
+      "ime_pin": {
+        "filter": "input::undo_manager::tests::ime_pin_",
+        "passed": 11,
+        "failed": 0,
+        "filtered_out": 1554,
+        "elapsed_s": 0.06
+      },
+      "text_wrapper": {
+        "filter": "input::display_map::text_wrapper::",
+        "passed": 27,
+        "failed": 0,
+        "filtered_out": 1538,
+        "elapsed_s": 2.6
+      },
+      "crlf_columnar": {
+        "filter": "input::state::tests::test_crlf_columnar",
+        "passed": 1,
+        "failed": 0,
+        "filtered_out": 1564,
+        "elapsed_s": 0.03
+      }
+    }
+  },
+  "editor_services_smoke": {
+    "passed": true,
+    "scenarios": [
+      "open_bom_crlf",
+      "delta_recovery",
+      "save_temp_fault",
+      "atomic_save",
+      "cross_block_nonoverlap",
+      "discard_guard"
+    ]
+  },
+  "native_smoke_scenarios": {
+    "total_runs": 8,
+    "all_passed": true,
+    "all_durable_ack": true,
+    "scenarios": {
+      "startup": {
+        "scenario": "startup",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 396.93,
+        "final_tab_count": 1,
+        "hydrated_editor_count": 1,
+        "pane_count": 1,
+        "visible_pane_count": 1,
+        "startup_restart_layout_verified": true,
+        "startup_metadata_view_count": 1,
+        "startup_group_count": 1,
+        "pending_wrap_rows_after_first_draw": 0
+      },
+      "full": {
+        "scenario": "full",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 1669.93,
+        "final_tab_count": 4,
+        "hydrated_editor_count": 3,
+        "paged_tab_count": 1,
+        "atomic_batch_single_undo_verified": true,
+        "stale_revision_rejected": true,
+        "chained_programmatic_edits_verified": true,
+        "pending_native_edit_guard_verified": true,
+        "replace_preserves_done_search_verified": true,
+        "unicode_search_verified": true,
+        "crlf_bom_roundtrip_verified": true,
+        "reopen_closed_tab_verified": true,
+        "discard_reload_durable_verified": true,
+        "post_shutdown_manifest_verified": true,
+        "clean_untitled_restart_verified": true,
+        "paged_streaming_search_matches": 72,
+        "kernel_parity_verified": true
+      },
+      "usability": {
+        "scenario": "usability",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 1239.08,
+        "final_tab_count": 13,
+        "hydrated_editor_count": 12,
+        "palette_undo_select_all_focus_verified": true,
+        "settings_nondirty_and_lazy_apply_verified": true,
+        "switcher_metadata_only_verified": true,
+        "crlf_line_ops_single_undo_verified": true,
+        "empty_untitled_prefs_layout_verified": true,
+        "format_flip_back_and_inflight_save_verified": true,
+        "format_only_bom_restart_and_save_verified": true,
+        "mru_persistence_verified": true,
+        "post_shutdown_manifest_verified": true,
+        "columnar_multicursor_single_undo_verified": true,
+        "json_lossless_and_undo_verified": true,
+        "image_viewer_budget_and_release_verified": true
+      },
+      "usability_restart_a": {
+        "scenario": "startup",
+        "source_scenario": "usability",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 386.47,
+        "final_tab_count": 13,
+        "hydrated_editor_count": 1,
+        "hydrated_content_bytes": 165,
+        "startup_restart_layout_verified": true,
+        "startup_metadata_view_count": 13,
+        "startup_group_count": 1,
+        "startup_inactive_hydrated_count": 0
+      },
+      "groups": {
+        "scenario": "groups",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 1741.46,
+        "final_tab_count": 5,
+        "hydrated_editor_count": 5,
+        "group_metadata_mutations_verified": true,
+        "group_undo_preserved_verified": true,
+        "group_cancel_restores_editability_verified": true,
+        "group_native_pending_guard_verified": true,
+        "group_close_reopen_verified": true,
+        "group_restart_layout_verified": true,
+        "group_batch_open_verified": true,
+        "group_bulk_cancel_verified": false,
+        "group_bulk_keep_verified": false,
+        "group_drag_drop_verified": true,
+        "group_drag_cancel_verified": true,
+        "group_keyboard_modal_verified": true
+      },
+      "splits": {
+        "scenario": "splits",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 4978.72,
+        "final_tab_count": 3,
+        "hydrated_editor_count": 1,
+        "hydrated_content_bytes": 12,
+        "paged_tab_count": 1,
+        "pane_count": 3,
+        "visible_pane_count": 3,
+        "split_native_ui_verified": true,
+        "split_restart_layout_verified": true,
+        "multiview_paged_shared_source_verified": true
+      },
+      "splits_restart_b": {
+        "scenario": "startup",
+        "source_scenario": "splits",
+        "description": "3 panes, 3 views, 1 shared Paged document (2 views) + 1 Editable document (1 view, 12 bytes)",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 393.74,
+        "final_tab_count": 3,
+        "hydrated_editor_count": 1,
+        "hydrated_content_bytes": 12,
+        "paged_tab_count": 1,
+        "pane_count": 3,
+        "visible_pane_count": 3,
+        "startup_restart_layout_verified": true,
+        "startup_metadata_view_count": 3,
+        "startup_group_count": 3,
+        "startup_inactive_hydrated_count": 0
+      },
+      "ime": {
+        "scenario": "ime",
+        "returncode": 0,
+        "passed": true,
+        "shutdown_durable_ack_observed": true,
+        "total_elapsed_ms": 6249.3,
+        "final_tab_count": 3,
+        "hydrated_editor_count": 3,
+        "ime_commit_undo_redo_verified": true,
+        "ime_unmark_and_empty_cancel_verified": true,
+        "ime_save_and_lifecycle_verified": true,
+        "ime_input_parity_verified": true,
+        "ime_post_shutdown_verified": true,
+        "datasets_count": 3,
+        "ops_per_dataset": 192,
+        "total_samples": 576
+      }
+    }
+  },
+  "spikes": {
+    "shared_text_feasibility": {
+      "exit_code": 0,
+      "status": "completed",
+      "phases_count": 66,
+      "failed_assertions": 0
+    },
+    "multiview_paged": {
+      "exit_code": 0,
+      "experiment": "multiview-paged-stage3-feasibility",
+      "configured_views": 8,
+      "passed": true,
+      "frames_drawn_total": 66,
+      "total_elapsed_ms": 814.076917,
+      "verified_flags_passed": 14,
+      "verified_flags_total": 14,
+      "close_to_zero_dense_stats": {
+        "mounted_views": 0,
+        "paging_sources": 0,
+        "paging_pages": 0,
+        "paging_cached_bytes": 0,
+        "paging_index_bytes": 0
+      }
+    }
+  },
+  "unverified_boundaries": {
+    "windows_desktop_gui_post_adr014": "not_verified",
+    "windows_x64_bare_metal_gui": "not_verified",
+    "linux_x64_desktop_gui": "not_verified",
+    "macos_intel_desktop_gui": "not_verified",
+    "physical_os_ime_candidate_window": "not_verified",
+    "editable_same_doc_multiview": "NO-GO (ADR 009)",
+    "nsh_ts_tsx_plugin_runtime": "deferred (T12/T16 not delivered)",
+    "adr017_018_remote_ci": "pending next push after commit 91c301c"
+  }
+}

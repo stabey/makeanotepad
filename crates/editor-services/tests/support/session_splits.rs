@@ -351,16 +351,133 @@ fn format_one_upgrades_in_memory_without_rewriting_raw_snapshot_until_normal_wri
     let service = RecoveryHandle::start(&db).unwrap();
     let manifest = receive(service.request_manifest().unwrap());
     assert_eq!(manifest.layout, layout);
-    assert_eq!(manifest.layout.tree.format_version, 2);
+    assert_eq!(manifest.layout.tree.format_version, 3);
     assert!(!manifest.repaired_or_fallback);
     let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let (version, stored): (u32, Vec<u8>) = conn.query_row("SELECT format_version,tree FROM layout_states WHERE id=(SELECT layout_id FROM layout_heads WHERE slot='current')", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!((version, stored), (1, raw.clone()));
     persist_test_layout(&service, &manifest.layout, vec![]);
     let version: u32 = conn.query_row("SELECT format_version FROM layout_states WHERE id=(SELECT layout_id FROM layout_heads WHERE slot='current')", [], |row| row.get(0)).unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let old: Vec<u8> = conn.query_row("SELECT tree FROM layout_states WHERE id=(SELECT layout_id FROM layout_heads WHERE slot='last_valid')", [], |row| row.get(0)).unwrap();
     assert_eq!(old, raw);
+    receive(service.shutdown().unwrap());
+}
+
+#[test]
+fn format_two_upgrades_in_memory_without_rewriting_raw_snapshot_until_normal_write() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("db");
+    let service = RecoveryHandle::start(&db).unwrap();
+    let layout = receive(service.request_manifest().unwrap()).layout;
+    receive(service.shutdown().unwrap());
+    drop(service);
+    let conn = Connection::open(&db).unwrap();
+    let mut legacy = serde_json::to_value(&layout.tree).unwrap();
+    legacy["format_version"] = 2.into();
+    let raw = serde_json::to_vec(&legacy).unwrap();
+    conn.execute("UPDATE layout_states SET format_version=2,tree=?1", [&raw])
+        .unwrap();
+    drop(conn);
+    let service = RecoveryHandle::start(&db).unwrap();
+    let manifest = receive(service.request_manifest().unwrap());
+    assert_eq!(manifest.layout, layout);
+    assert_eq!(manifest.layout.tree.format_version, 3);
+    assert!(!manifest.repaired_or_fallback);
+    let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let (version, stored): (u32, Vec<u8>) = conn
+        .query_row(
+            "SELECT format_version,tree FROM layout_states WHERE id=(SELECT layout_id FROM layout_heads WHERE slot='current')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((version, stored), (2, raw.clone()));
+    persist_test_layout(&service, &manifest.layout, vec![]);
+    let version: u32 = conn
+        .query_row(
+            "SELECT format_version FROM layout_states WHERE id=(SELECT layout_id FROM layout_heads WHERE slot='current')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 3);
+    let old: Vec<u8> = conn
+        .query_row(
+            "SELECT tree FROM layout_states WHERE id=(SELECT layout_id FROM layout_heads WHERE slot='last_valid')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old, raw);
+    receive(service.shutdown().unwrap());
+}
+
+#[test]
+fn stored_v2_layout_with_duplicate_doc_is_corrupt_and_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("db");
+    let service = RecoveryHandle::start(&db).unwrap();
+    let mut base = receive(service.request_manifest().unwrap()).layout;
+    let pane = base.active_pane_id();
+    let first = add_in(&mut base, pane, GroupId::UNGROUPED);
+    let base_rev = persist_test_layout(
+        &service,
+        &base,
+        vec![DocumentChange::Create(DocumentMetaRecord {
+            key: first.document,
+            meta: DocMeta {
+                title: "paged.log".into(),
+                paged: true,
+                ..DocMeta::default()
+            },
+        })],
+    );
+    let mut multi = base.clone();
+    let second_id = ViewId::new();
+    multi
+        .insert_shared_view(
+            pane,
+            LayoutView {
+                id: second_id,
+                document: first.document,
+                group_id: GroupId::UNGROUPED,
+                view: ViewState::default(),
+            },
+            None,
+            false,
+        )
+        .unwrap();
+    let multi_rev = persist_test_layout(&service, &multi, Vec::new());
+    receive(service.shutdown().unwrap());
+    drop(service);
+
+    let conn = Connection::open(&db).unwrap();
+    let mut v2_tree = serde_json::to_value(&multi.tree).unwrap();
+    v2_tree["format_version"] = 2.into();
+    conn.execute(
+        "UPDATE layout_states SET format_version=2,tree=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_vec(&v2_tree).unwrap(), multi_rev.0 as i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let service = RecoveryHandle::start(&db).unwrap();
+    let manifest = receive(service.request_manifest().unwrap());
+    assert!(manifest.repaired_or_fallback);
+    assert!(!manifest.warnings.is_empty());
+    assert_eq!(manifest.layout, base);
+    assert_eq!(manifest.source_layout_revision, Some(base_rev));
+    let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM preserved_layouts WHERE layout_id=?1",
+            [multi_rev.0 as i64],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
     receive(service.shutdown().unwrap());
 }
 

@@ -331,3 +331,17 @@ CI下载产物的额外运行见[报告](evidence/ime-ci-macos-native.json)、[O
 - **诚实代价与权衡**：全唯一百万行的完整CoreText整形总量并未凭空消失（因为没有近似字形宽度），`short_unique`后台全量收敛耗时为**9.28秒**（9,283.03 ms均值，退休指令数166.60B vs 旧版同步7.10秒 / 153.56B），即将原先阻塞首帧的7.10秒同步整形拆分为344.53 ms首屏可交互 + 分帧后台渐进完成，同时利用256条`WindowTextSystem`轮换消除约1.86 GiB长期内存滞留。
 - **`short_repeated`与`long_64k`**：`short_repeated`默认首帧就绪由422.11 ms降至321.12 ms；`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`全量收敛耗时1,689.09 ms，peak RSS中位数369.83 MiB（3次样本中两次约369.5–369.8 MiB、一次峰值505.70 MiB，均远低于旧版唯一行2.27 GiB）。`long_64k`总行数1,024 ≤ 4,096，首帧即100%同步完成（`pending_wrap_rows_after_first_draw = 0`），peak RSS略降约3.1 MiB且耗时持平。
 - **样本与范围限制**：每组样本为1–3次（不推导p95），未清OS缓存（warm/unspecified），且`visible_panes_ready_ms`与`full_wrap_converged_ms`反映Metal绘制调用边界而非物理屏幕像素扫描；本轮未在Windows或Linux上采集ADR 016桌面性能对照。
+
+## ADR 017 / ADR 018 合入后的回归观察与有界预算
+
+合入ADR 017（`schema v3` / `layout format v3`、主应用只读同文档多视口）与ADR 018（纯Rust无损JSON/JSONC与有界只读光栅图像预览）后，本轮在macOS ARM64上执行了完整release回归验证（见[ADR 017/018本地回归报告](evidence/adr017-018-native-regressions.json)，二进制`target/release/editor` SHA-256 `0eda21fe48255d1c785f923f37fc7d72d152f258f5b57337911aedac03d9ad34`），**未重跑上述ADR 016 64 MiB折行配对基准或100/1024标签×1/2/4/8窗格矩阵**，亦未在Windows/Linux上采集新的桌面性能样本。
+
+- **Release回归端到端耗时与重启惰性加载验证（单次串行样本，含退出持久化ACK，warm/unspecified）**：
+  - `startup`（默认空白启动）：`396.93 ms`，`pending_wrap_rows_after_first_draw = 0`。
+  - **Restart A（`usability` 13视图会话 → `--smoke=startup`）**：`386.47 ms`，恢复`13`个视图（`1`个分组），仅hydrate `1`个活动编辑器（`165 B`正文、`startup_inactive_hydrated_count = 0`）。
+  - **Restart B（`splits` 3窗格多视图会话 → `--smoke=startup`）**：`393.74 ms`，恢复`3`窗格、`3`视图、`3`分组，仅存在`1`个共享源`Paged`文档（2个独立视口，`paged_tab_count = 1`）与`1`个活动`Editable`文档（`12 B`正文，`hydrated_editor_count = 1`，`startup_inactive_hydrated_count = 0`）。
+  - `spikes/multiview-paged --views 8`：66帧总耗时`814.076917 ms`，关闭至零后`mounted_views = 0`、`paging_sources = 0`、`paging_pages = 0`、`paging_cached_bytes = 0`、`paging_index_bytes = 0`。
+- **ADR 018运行时资源上界（硬编码预算，非RSS硬上限）**：
+  - **JSON/JSONC工具**：`MAX_JSON_TOOL_BYTES = 4 MiB`、`MAX_JSON_DEPTH = 2048`；背景线程计算，超限拒绝而不分配/阻塞UI。
+  - **光栅图像预解码与工作区缓存**：单图魔数+有界头探测（`<= 64 KiB`前缀及有界`read_at`）闸门限制`32 MiB`文件体、`8192 × 8192 px`、`128`帧与`128 MiB`估算解码RGBA；工作区所有已解码`Ready`图像共享`MAX_WORKSPACE_IMAGE_BYTES = 256 MiB` LRU驱逐上限，并在驱逐、取消/过期、关闭、重载与正常退出时显式调用`cx.drop_image`释放GPUI `sprite_atlas`纹理资源。
+- **测量边界**：上述耗时为单次`--smoke`场景全过程计时，仅证明主应用在`schema v3`与只读多视口/工具接入后保持惰性加载及单源共享语义，不作为多样本p95或跨平台桌面性能证明。

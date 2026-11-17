@@ -308,3 +308,36 @@ ADR012实现与复审无剩余阻塞；不改变IME事件/历史协议、应用�
   - `spikes/multiview-paged --views 8`：exit `0`，`passed = true`，全部**14/14** `*_verified`标志为`true`（66绘制帧、总耗时647.77 ms、关闭至零后缓存/索引归零）。
 - **过程缺陷透明记录（#21/#22/#23）**：第一轮Phase C配对基准运行中，`EDITOR_SMOKE_AWAIT_FULL_WRAP=1`多帧渐进折行曾导致`short_unique`峰值RSS升至`1500.91 MiB`（`short_repeated`升至`759.6 MiB`），触发验证阻断并暂停；根因排查定位为`apps/editor/src/smoke.rs`在3处绘制调用（第338、360及`pump_frame`第1643行）以`let _ = window.draw(cx);`丢弃`ArenaClearNeeded`，阻止`cx.element_arena`跨帧清理。将3处全部修复为`window.draw(cx).clear(cx);`后，重建release并重跑全部Phase A–D测试与[ADR 016配对基准](evidence/adr015-016-startup-paired.json)，`short_unique`全量收敛peak RSS降至**464.97 MiB均值 / 500.94 MiB中位数**（最大`515.31 MiB`）。
 - **未验证与保留边界**：上述全部ADR 015/016原生GUI与配对基准均在本地macOS Apple Silicon执行；合入ADR 015/016后的Windows二进制尚待下一次五目标CI与Parallels Windows桌面复验（验证无黑框启动、管道输出与`\\?\`显示剥离）；裸机Windows x64 / Linux x64 / macOS Intel桌面GUI、物理系统输入法候选窗、代码签名/公证/安装包、同文档主应用可编辑/分页多视图及NSH插件集成仍未交付或未验收。所有`/tmp/adr016_*`临时工作目录已清理，`.smoke-data`无新增残留。
+
+## Wave 0 五目标原生CI（44015994062）
+
+提交`91c301c86d9bbaaacfc334e68e95072647107497`（25个文件，含ADR 015/016）触发的[GitHub Actions Native CI 44015994062](https://github.com/stabey/makeanotepad/actions/runs/44015994062)全部**6个job**为`completed / success`：`fmt`、`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`。
+
+- 两个Windows目标均已完成`editor.exe` PE GUI子系统（`0x0002`）与`editor-services.exe` PE CUI子系统（`0x0003`）打包校验、release构建与无窗口CLI/保存验证，产物已可用于用户的Windows实机测试。
+- 托管CI仍不执行原生桌面GUI、物理HID/IME或性能基线验收；合入ADR 017/018后的代码待下一次推送再触发CI。
+
+## ADR 017 + ADR 018（Schema v3 / 只读多视口 / 无损 JSON / 有界图像预览）本地验证
+
+全部验证均在最终代码（post-`#51`）定稿后于本机macOS ARM64串行完成，零`Cargo.lock`改动，原始汇总见[ADR 017/018本地回归报告](evidence/adr017-018-native-regressions.json)。
+
+- **格式、Git卫生与Release二进制身份**：
+  - `cargo fmt --all -- --check`与`cargo fmt --manifest-path spikes/multiview-paged/Cargo.toml -- --check`均exit `0`；`git diff Cargo.lock`为空，`.omp/rules/editor-team.md`仅保留既有本地差异。
+  - `cargo build --locked --release --workspace`（`32.98s`，0警告）产物的SHA-256：`target/release/editor`为`0eda21fe48255d1c785f923f37fc7d72d152f258f5b57337911aedac03d9ad34`，`target/release/editor-services`为`6ba1fde7ad0dee18d9f56d8cc4de2ec92b69ea123972e17449a78a1d1d2a400a`。
+- **打包、工作区测试、vendor私有测试与服务Smoke**：
+  - `python3 -B -m unittest discover -s scripts/ci -p test_package_artifact.py -v`：**9/9** OK（`0.010s`）。
+  - `cargo test --locked --workspace`：**195/195**通过（`editor` lib `82`、`editor` bin `0`、`editor-services` lib `27`、`editor-services` bin `0`、`editor-services` `tests/services.rs`集成测试`86`，doc-tests `0`，0失败、0忽略、0警告）。
+  - `vendor/gpui-base`（`--features test-support`）：`ime_pin_` **11/11**（过滤1,554）、`text_wrapper::` **27/27**（过滤1,538）、`test_crlf_columnar` **1/1**（过滤1,564）。
+  - `./target/release/editor-services smoke`通过全部**6个场景**（`open_bom_crlf`、`delta_recovery`、`save_temp_fault`、`atomic_save`、`cross_block_nonoverlap`、`discard_guard`）。
+- **8次Release原生GUI回归（macOS ARM64，均`exit 0`、`passed = true`、`shutdown_durable_ack_observed = true`）**：
+  - `startup`（`396.93 ms`）：`final_tab_count=1`、`hydrated_editor_count=1`、`pane_count=1`、`visible_pane_count=1`、`startup_restart_layout_verified=true`、`startup_metadata_view_count=1`、`startup_group_count=1`、`pending_wrap_rows_after_first_draw=0`。
+  - `full`（`1669.93 ms`）：`final_tab_count=4`、`hydrated_editor_count=3`、`paged_tab_count=1`、全部事务/版本/守卫/unicode/CRLF-BOM/重开/丢弃重载/post-shutdown/空白重启标志为`true`，`paged_streaming_search_matches=72`、`kernel_parity_verified=true`。
+  - `usability`（`1239.08 ms`）：`final_tab_count=13`、`hydrated_editor_count=12`、`columnar_multicursor_single_undo_verified=true`、`json_lossless_and_undo_verified=true`（严格`ValidateJson`拒绝尾逗号并后台光标跳转而不改写正文、`FormatJsonc`保真注释/尾逗号/重复键/大整数/`-0`/`1e+05`/`\u0041\n`/Emoji并单步`Undo`、`ValidateJson`/`FormatJson`/`MinifyJson`与单步`Undo`、SQLite持久化）、`image_viewer_budget_and_release_verified=true`（`20000x20000` PNG头`OverBudget`拦截零整图解码、4×4 PNG解码`Ready`、`ImageZoomActualSize`→`ImageZoomIn` 125%→`ImageZoomFit`、关闭+刷帧后`Weak<RenderImage>`立即释放及MRU更新）、`post_shutdown_manifest_verified=true`、`mru_persistence_verified=true`及全部8项既有usability标志为`true`。
+  - **Restart A（`usability` → `--smoke=startup`）**（`386.47 ms`）：`final_tab_count=13`、`hydrated_editor_count=1`、`hydrated_content_bytes=165`、`startup_restart_layout_verified=true`、`startup_metadata_view_count=13`、`startup_group_count=1`、`startup_inactive_hydrated_count=0`。
+  - `groups`（`1741.46 ms`）：`final_tab_count=5`、`hydrated_editor_count=5`、`group_restart_layout_verified=true`及所执行的9项`group_*_verified`全部为`true`（1000草稿bulk标志仅对应大夹具分支）。
+  - `splits`（`4978.72 ms`）：`final_tab_count=3`、`hydrated_editor_count=1`、`hydrated_content_bytes=12`、`paged_tab_count=1`、`pane_count=3`、`visible_pane_count=3`、`split_native_ui_verified=true`、`split_restart_layout_verified=true`、`multiview_paged_shared_source_verified=true`（~300 KiB分页文件`SplitAndCloneActiveViewRight`共享同一`DocumentKey`与1份`PagingService`源、独立偏移跳转、次视图无弹窗快速关闭、重拆分并磁盘截断重载触发ADR 009折叠为单`Editable`视图，随后生成持久化3窗格多视图会话）。
+  - **Restart B（`splits` → `--smoke=startup`）**（`393.74 ms`）：`passed=true`、`startup_restart_layout_verified=true`、`final_tab_count=3`、`hydrated_editor_count=1`、`hydrated_content_bytes=12`、`paged_tab_count=1`、`pane_count=3`、`visible_pane_count=3`、`startup_metadata_view_count=3`、`startup_group_count=3`、`startup_inactive_hydrated_count=0`（验证3窗格、3视图、1个共享源Paged文档2视图 + 1个12 B Editable文档跨进程重启恢复）。
+  - `ime`（`6249.30 ms`）：`final_tab_count=3`、`hydrated_editor_count=3`、全部5项`ime_*_verified=true`（3种规模数据集×192次操作 = 576样本）。
+- **两个隔离Release实验复验**：
+  - `spikes/shared-text-feasibility`：exit `0`、`status=completed`、`phases=66`、`failed_assertions=0`。
+  - `spikes/multiview-paged --views 8`：exit `0`、`passed=true`、`configured_views=8`、`frames_drawn_total=66`、`total_elapsed_ms=814.076917`、全部**14/14** `*_verified`为`true`、`close_to_zero_dense_stats`全归零（`mounted_views=0`、`paging_sources=0`、`paging_pages=0`、`paging_cached_bytes=0`、`paging_index_bytes=0`）。
+- **清理与未验证边界**：验证生成的`/tmp/v3_verify_*`临时目录已全部删除并核实零残留。未验证边界保持不变：ADR 015–018重建产物尚未完成Windows桌面实机复验，Windows x64裸机 / Linux x64 / macOS Intel桌面GUI、物理系统输入法候选窗、像素截图、主应用Editable同文档多视图（NO-GO）及NSH/TSX插件宿主（`T12`/`T16`暂缓）均未验证或未交付，ADR 017/018远端CI待下次推送触发。

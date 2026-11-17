@@ -1245,7 +1245,8 @@ async fn phase_3b_paged_resize_b3_and_close_pane_tabs(
                 cx.update(|cx| {
                     let ws = workspace.read(cx);
                     ws.pane_active_target(pid).is_some_and(|t| {
-                        matches!(ws.view_slot(t.view_id), Some(TabSlot::Paged(pv)) if pv.current_slice.is_some())
+                        ws.paged_view(t.view_id)
+                            .is_some_and(|(_, vp)| vp.current_slice.is_some())
                     })
                 })
             },

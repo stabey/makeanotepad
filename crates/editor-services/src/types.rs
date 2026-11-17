@@ -53,6 +53,7 @@ pub enum ReadOnlyReason {
     BinaryContent,
     LongLine,
     LargeFile,
+    ImagePreview,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentIdentity {
@@ -300,8 +301,10 @@ pub struct DocMeta {
     pub language_override: Option<String>,
     pub readonly_reason: Option<ReadOnlyReason>,
     pub paged: bool,
+    #[serde(default)]
+    pub image_preview: bool,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewState {
     pub cursor_byte: u64,
     pub scroll_byte: u64,

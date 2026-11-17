@@ -12,8 +12,9 @@ use editor_services::{
     ErrorKind, FaultInjector, GroupId, HydratedDraft, IndexStatus, LifecycleGen, LineEnding,
     OpenOptions, OpenOutcome, PagingService, PaneId, RecoveryEvent, RecoveryHandle, Revision,
     SaveOutcome, SaveRequest, SearchService, SearchTarget, ServiceError, SessionDocumentStub,
-    SessionLayout, SessionManifest, ShellTheme, TryRecvError, UiShellLoad, UiShellState,
-    UiShellStore, ViewId, ViewState, ViewTarget, ViewportAnchor, open_document, save_document,
+    SessionLayout, SessionManifest, ShellTheme, SplitDirection, TryRecvError, UiShellLoad,
+    UiShellState, UiShellStore, ViewId, ViewState, ViewTarget, ViewportAnchor, open_document,
+    save_document,
 };
 #[path = "session_core.rs"]
 mod session_core;
@@ -37,18 +38,20 @@ use ropey::Rope;
 use session_core::*;
 
 use crate::actions::{
-    CancelActiveSearch, ClearRecentFiles, CloseActiveTab, CycleLanguage, CycleSearchKernel,
-    DeleteLine, DuplicateLine, FindNextMatch, FindPrevMatch, MoveLineDown, MoveLineUp, NewTab,
-    NextTab, OpenCommandPalette, OpenFile, OpenGoToOffset, OpenQuickSwitcher, PrevTab, QuitEditor,
-    ReloadActiveDocument, ReopenClosedTab, SaveFile, SaveFileAs, SelectLangBash, SelectLangC,
-    SelectLangCpp, SelectLangCss, SelectLangGo, SelectLangHtml, SelectLangJavascript,
-    SelectLangJson, SelectLangMake, SelectLangMarkdown, SelectLangPlaintext, SelectLangPython,
-    SelectLangRust, SelectLangSql, SelectLangSwift, SelectLangToml, SelectLangTsx,
-    SelectLangTypescript, SelectLangXml, SelectLangYaml, SelectLanguageAuto, SetEncodingUtf8,
-    SetEncodingUtf8Bom, SetIndentSpaces2, SetIndentSpaces4, SetIndentSpaces8, SetIndentTabs2,
-    SetIndentTabs4, SetIndentTabs8, SetLineEndingCrlf, SetLineEndingLf, ToggleComment,
+    CancelActiveSearch, ClearRecentFiles, CloneActiveReadOnlyView, CloseActiveTab, CycleLanguage,
+    CycleSearchKernel, DeleteLine, DuplicateLine, FindNextMatch, FindPrevMatch, FormatJson,
+    FormatJsonc, ImageZoomActualSize, ImageZoomFit, ImageZoomIn, ImageZoomOut, MinifyJson,
+    MinifyJsonc, MoveLineDown, MoveLineUp, NewTab, NextTab, OpenCommandPalette, OpenFile,
+    OpenGoToOffset, OpenQuickSwitcher, PrevTab, QuitEditor, ReloadActiveDocument, ReopenClosedTab,
+    SaveFile, SaveFileAs, SelectLangBash, SelectLangC, SelectLangCpp, SelectLangCss, SelectLangGo,
+    SelectLangHtml, SelectLangJavascript, SelectLangJson, SelectLangMake, SelectLangMarkdown,
+    SelectLangPlaintext, SelectLangPython, SelectLangRust, SelectLangSql, SelectLangSwift,
+    SelectLangToml, SelectLangTsx, SelectLangTypescript, SelectLangXml, SelectLangYaml,
+    SelectLanguageAuto, SetEncodingUtf8, SetEncodingUtf8Bom, SetIndentSpaces2, SetIndentSpaces4,
+    SetIndentSpaces8, SetIndentTabs2, SetIndentTabs4, SetIndentTabs8, SetLineEndingCrlf,
+    SetLineEndingLf, SplitAndCloneActiveViewDown, SplitAndCloneActiveViewRight, ToggleComment,
     ToggleLineEnding, ToggleReplace, ToggleSearch, ToggleShowWhitespace, ToggleSidebar,
-    ToggleSoftWrap, ToggleThemeMode, ToggleUtf8Bom,
+    ToggleSoftWrap, ToggleThemeMode, ToggleUtf8Bom, ValidateJson, ValidateJsonc,
 };
 use crate::budget::{
     AdmissionDecision, HydratedSlotInfo, HydrationBudgetConfig, plan_hydration_admission,
@@ -58,9 +61,14 @@ use crate::editor_adapter::{
     ApplyEditsError, CommittedMutationOutcome, EditorAdapter, FormatChangeOutcome,
     HydrateEditorParams, MAX_ORDINARY_DOC_BYTES, PendingSavepointCheck,
 };
+use crate::image_view::{ImagePayloadState, ImageTabState, ImageViewportState, ImageZoomMode};
+use crate::json_tools::{
+    JsonDialect, JsonError, JsonIndent, JsonTransformMode, MAX_JSON_TOOL_BYTES,
+    plan_rope_transform, validate_json_str,
+};
 use crate::language::next_language;
 use crate::line_ops::{LineOpKind, LineOpPlan, plan_line_op, plan_toggle_comment_for_language};
-use crate::paged_view::{PagedTabState, format_bytes, parse_jump_query};
+use crate::paged_view::{PagedSourceState, PagedViewportState, format_bytes, parse_jump_query};
 use crate::search_bar::{
     SearchQueryKind, SearchSessionState, SearchStatus, plan_replacement_edits,
     run_editable_extended_search,
@@ -80,7 +88,8 @@ pub(crate) enum TabSlot {
         reason: String,
     },
     Editable(EditorAdapter),
-    Paged(PagedTabState),
+    Paged(PagedSourceState),
+    Image(ImageTabState),
     Failed {
         stub: SessionDocumentStub,
         error: String,
@@ -91,6 +100,7 @@ impl TabSlot {
         match self {
             Self::Editable(ed) => ed.doc_id,
             Self::Paged(pv) => pv.doc_id,
+            Self::Image(img) => img.doc_id,
             Self::Dehydrated(s)
             | Self::Hydrating { stub: s, .. }
             | Self::OverBudgetDraft { stub: s, .. }
@@ -101,6 +111,7 @@ impl TabSlot {
         match self {
             Self::Editable(ed) => ed.lifecycle_gen,
             Self::Paged(pv) => pv.lifecycle_gen,
+            Self::Image(img) => img.lifecycle_gen,
             Self::Dehydrated(s)
             | Self::Hydrating { stub: s, .. }
             | Self::OverBudgetDraft { stub: s, .. }
@@ -117,6 +128,7 @@ impl TabSlot {
         match self {
             Self::Editable(ed) => &ed.meta,
             Self::Paged(pv) => &pv.meta,
+            Self::Image(img) => &img.meta,
             Self::Dehydrated(s)
             | Self::Hydrating { stub: s, .. }
             | Self::OverBudgetDraft { stub: s, .. }
@@ -130,7 +142,7 @@ impl TabSlot {
     pub(crate) fn has_checkpoint(&self) -> bool {
         match self {
             Self::Editable(ed) => ed.has_checkpoint,
-            Self::Paged(_) => false,
+            Self::Paged(_) | Self::Image(_) => false,
             Self::Dehydrated(s)
             | Self::Hydrating { stub: s, .. }
             | Self::OverBudgetDraft { stub: s, .. }
@@ -143,7 +155,7 @@ impl TabSlot {
     pub(super) fn close_guard(&self) -> bool {
         match self {
             Self::Editable(ed) => ed.is_dirty(),
-            Self::Paged(_) => false,
+            Self::Paged(_) | Self::Image(_) => false,
             _ => self.has_checkpoint() || self.proven_modified(),
         }
     }
@@ -169,6 +181,11 @@ impl TabSlot {
             Self::Paged(_) => HonestSlotBadge {
                 short_badge: Some("PG"),
                 detail_hint: Some("Paged read-only"),
+                proven_modified: false,
+            },
+            Self::Image(_) => HonestSlotBadge {
+                short_badge: Some("IMG"),
+                detail_hint: Some("Image preview (read-only)"),
                 proven_modified: false,
             },
             Self::Dehydrated(stub) => {
@@ -234,6 +251,8 @@ pub struct EditorWorkspace {
 
     pub(crate) session: SessionLayout,
     pub(crate) documents: HashMap<DocumentId, TabSlot>,
+    pub(crate) paged_viewports: HashMap<ViewId, PagedViewportState>,
+    pub(crate) image_viewports: HashMap<ViewId, ImageViewportState>,
     pub(crate) group_ui: GroupUiState,
     pane_runtime: PaneRuntime,
     recently_closed: Vec<ClosedViewRecord>,
@@ -387,6 +406,8 @@ impl EditorWorkspace {
             untitled_counter: 0,
             session: SessionLayout::default(),
             documents: HashMap::new(),
+            paged_viewports: HashMap::new(),
+            image_viewports: HashMap::new(),
             group_ui: GroupUiState::default(),
             pane_runtime: PaneRuntime::default(),
             recently_closed: Vec::new(),
@@ -775,9 +796,9 @@ impl EditorWorkspace {
         let has_incomplete = self.documents.values().any(|slot| {
             matches!(
                 slot,
-                TabSlot::Paged(pv)
-                    if matches!(pv.index_status, IndexStatus::Indexing { .. })
-                        && pv.source_error.is_none()
+                TabSlot::Paged(src)
+                    if matches!(src.index_status, IndexStatus::Indexing { .. })
+                        && src.source_error.is_none()
             )
         });
         if !has_incomplete {
@@ -793,31 +814,78 @@ impl EditorWorkspace {
                             this.paged_indexer_running = false;
                             return None;
                         }
-                        let len = this.session.view_count();
-                        let ready = |id| matches!(this.view_slot(id), Some(TabSlot::Paged(pv)) if !pv.is_loading && pv.source_error.is_none() && matches!(pv.index_status, IndexStatus::Indexing { .. }));
-                        let visible = this.pane_active_target(this.active_pane_id()).into_iter()
-                            .chain(this.visible_targets()).find(|target| ready(target.view_id));
-                        let pick = visible.map(|target| (None, target)).or_else(|| {
-                            (0..len).find_map(|offset| {
-                                let position = (this.paged_index_rr_cursor + offset) % len;
-                                let (_, id) = this.session.view_at_index(position)?;
-                                ready(id).then(|| (Some(position), this.view_target(id).unwrap()))
+                        let has_loading_visible_viewport = |doc_id: DocumentId| -> bool {
+                            this.visible_targets().any(|t| {
+                                t.document.doc_id == doc_id
+                                    && this
+                                        .paged_viewports
+                                        .get(&t.view_id)
+                                        .is_some_and(|vp| vp.is_loading)
                             })
-                        });
-                        if let Some((position, target)) = pick {
-                            if let Some(position) = position { this.paged_index_rr_cursor = (position + 1) % len; }
-                            if let Some(TabSlot::Paged(pv)) = this.view_slot(target.view_id) {
-                                return Some(Ok((target, pv.handle.clone(), pv.source_gen, pv.index_cancel_token())));
+                        };
+                        let doc_needs_index = |src: &PagedSourceState| -> bool {
+                            src.source_error.is_none()
+                                && matches!(src.index_status, IndexStatus::Indexing { .. })
+                        };
+
+                        let visible_pick = this
+                            .pane_active_target(this.active_pane_id())
+                            .into_iter()
+                            .chain(this.visible_targets())
+                            .find_map(|target| match this.documents.get(&target.document.doc_id) {
+                                Some(TabSlot::Paged(src))
+                                    if doc_needs_index(src)
+                                        && !has_loading_visible_viewport(src.doc_id) =>
+                                {
+                                    Some((
+                                        src.doc_id,
+                                        src.handle.clone(),
+                                        src.source_gen,
+                                        src.index_cancel_token(),
+                                    ))
+                                }
+                                _ => None,
+                            });
+
+                        if let Some(job) = visible_pick {
+                            return Some(Ok(job));
+                        }
+
+                        let mut ready_docs: Vec<DocumentId> = this
+                            .documents
+                            .values()
+                            .filter_map(|slot| match slot {
+                                TabSlot::Paged(src)
+                                    if doc_needs_index(src)
+                                        && !has_loading_visible_viewport(src.doc_id) =>
+                                {
+                                    Some(src.doc_id)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        ready_docs.sort_by_key(|id| id.0);
+                        if !ready_docs.is_empty() {
+                            let idx = this.paged_index_rr_cursor % ready_docs.len();
+                            this.paged_index_rr_cursor = (idx + 1) % ready_docs.len();
+                            let doc_id = ready_docs[idx];
+                            if let Some(TabSlot::Paged(src)) = this.documents.get(&doc_id) {
+                                return Some(Ok((
+                                    doc_id,
+                                    src.handle.clone(),
+                                    src.source_gen,
+                                    src.index_cancel_token(),
+                                )));
                             }
                         }
 
-                        // Check if any tab still needs indexing once its foreground viewport finishes.
+                        // Check if any doc still needs indexing once its foreground viewport finishes.
                         let any_pending_after_viewport = this.documents.values().any(|slot| {
                             matches!(
                                 slot,
-                                TabSlot::Paged(pv)
-                                    if pv.source_error.is_none()
-                                        && matches!(pv.index_status, IndexStatus::Indexing { .. })
+                                TabSlot::Paged(src)
+                                    if src.source_error.is_none()
+                                        && matches!(src.index_status, IndexStatus::Indexing { .. })
                             )
                         });
                         if any_pending_after_viewport {
@@ -833,12 +901,12 @@ impl EditorWorkspace {
                 match next_job {
                     None => break,
                     Some(Err(())) => {
-                        // Active paged tab is loading a foreground viewport; yield briefly.
+                        // Active paged viewport is loading in foreground; yield briefly.
                         cx.background_executor()
                             .timer(Duration::from_millis(25))
                             .await;
                     }
-                    Some(Ok((target, handle, source_gen, cancel))) => {
+                    Some(Ok((doc_id, handle, source_gen, cancel))) => {
                         if cancel.is_cancelled() {
                             continue;
                         }
@@ -850,14 +918,13 @@ impl EditorWorkspace {
                         let mut backoff_ms = 10u64;
                         let alive = weak
                             .update(cx, |this, cx| {
-                                if this.session.resolve(target).is_err() { return !this.shutting_down; }
-                                if let Some(TabSlot::Paged(pv)) =
-                                    this.documents.get_mut(&target.document.doc_id)
-                                {
-                                    if pv.source_gen != source_gen { return !this.shutting_down; }
+                                if let Some(TabSlot::Paged(src)) = this.documents.get_mut(&doc_id) {
+                                    if src.source_gen != source_gen {
+                                        return !this.shutting_down;
+                                    }
                                     match step {
                                         Ok(status) => {
-                                            pv.index_status = status;
+                                            src.index_status = status;
                                             cx.notify();
                                         }
                                         Err(err) if err.kind == ErrorKind::Busy => {
@@ -865,8 +932,8 @@ impl EditorWorkspace {
                                         }
                                         Err(err) if err.kind == ErrorKind::Cancelled => {}
                                         Err(err) => {
-                                            pv.source_error = Some(err.message);
-                                            if this.search.target_view == Some(target) {
+                                            src.source_error = Some(err.message);
+                                            if this.search.target_doc_id == Some(doc_id) {
                                                 this.search.cancel_active();
                                                 this.search.status = SearchStatus::Invalidated;
                                             }
@@ -968,7 +1035,8 @@ impl EditorWorkspace {
                     if let Err(err) = shell_res {
                         eprintln!("editor preferences shutdown warning: {}", err.message);
                     }
-                    let _ = weak.update_in(cx, |this, _, cx| {
+                    let _ = weak.update_in(cx, |this, window, cx| {
+                        this.release_all_image_gpu_resources(Some(window), cx);
                         this.quit_confirmed = true;
                         cx.quit();
                     });
@@ -976,6 +1044,7 @@ impl EditorWorkspace {
                 .detach();
                 return;
             }
+            self.release_all_image_gpu_resources(Some(window), cx);
             self.quit_confirmed = true;
             cx.quit();
             return;
@@ -1196,8 +1265,9 @@ impl EditorWorkspace {
                 crate::smoke::emit_smoke_report(&report, smoke_report_path.as_deref());
                 if report.passed {
                     if weak
-                        .update_in(cx, |this, _, cx| {
+                        .update_in(cx, |this, window, cx| {
                             this.shutdown_durable_ack.store(actual_shutdown_ack, Ordering::Release);
+                            this.release_all_image_gpu_resources(Some(window), cx);
                             this.quit_confirmed = true;
                             cx.quit();
                         })
@@ -1221,6 +1291,7 @@ impl EditorWorkspace {
             let _ = weak.update_in(cx, |this, window, cx| match barrier_res {
                 Ok(()) => {
                     this.shutdown_durable_ack.store(actual_shutdown_ack, Ordering::Release);
+                    this.release_all_image_gpu_resources(Some(window), cx);
                     this.quit_confirmed = true;
                     cx.quit();
                 }
@@ -1240,6 +1311,7 @@ impl EditorWorkspace {
                     cx.notify();
                 }
                 Err(_) => {
+                    this.release_all_image_gpu_resources(Some(window), cx);
                     this.quit_confirmed = true;
                     cx.quit();
                 }
@@ -1486,11 +1558,14 @@ impl EditorWorkspace {
         let fill = cx.theme().warning.opacity(0.24);
         let active = cx.theme().primary.opacity(0.42);
         let selected_ix = self.search.selected_index;
+        let Some(active_view_id) = self.active_view_id() else {
+            return;
+        };
+        let Some(doc_id) = self.view_slot(active_view_id).map(TabSlot::doc_id) else {
+            return;
+        };
 
-        match self
-            .active_document_id()
-            .and_then(|id| self.documents.get_mut(&id))
-        {
+        match self.documents.get_mut(&doc_id) {
             Some(TabSlot::Editable(ed)) => {
                 if !self.search.visible || self.search.target_doc_id != Some(ed.doc_id) {
                     ed.clear_search_highlights(cx);
@@ -1510,10 +1585,21 @@ impl EditorWorkspace {
                     .collect();
                 ed.set_search_highlights(&ranges, selected_ix, fill, active, cx);
             }
-            Some(TabSlot::Paged(pv)) => {
-                pv.highlighted_byte_range = selected_ix
-                    .and_then(|ix| self.search.matches.get(ix))
-                    .map(|m| m.byte_range.clone());
+            Some(TabSlot::Paged(_)) => {
+                if let Some(vp) = self.paged_viewports.get_mut(&active_view_id) {
+                    let is_target_view = self.search.visible
+                        && self
+                            .search
+                            .target_view
+                            .is_some_and(|t| t.view_id == active_view_id);
+                    vp.highlighted_byte_range = if is_target_view {
+                        selected_ix
+                            .and_then(|ix| self.search.matches.get(ix))
+                            .map(|m| m.byte_range.clone())
+                    } else {
+                        None
+                    };
+                }
             }
             _ => {}
         }
@@ -1531,6 +1617,9 @@ impl EditorWorkspace {
         {
             return;
         }
+        let Some(active_target) = self.active_view_id().and_then(|id| self.view_target(id)) else {
+            return;
+        };
         let Some(hit) = self.search.matches.get(match_index).cloned() else {
             return;
         };
@@ -1555,17 +1644,17 @@ impl EditorWorkspace {
                     }
                 }
             }
-            Some(TabSlot::Paged(pv)) => {
-                pv.highlighted_byte_range = Some(hit.byte_range.clone());
+            Some(TabSlot::Paged(_)) => {
+                if let Some(vp) = self.paged_viewports.get_mut(&active_target.view_id) {
+                    vp.highlighted_byte_range = Some(hit.byte_range.clone());
+                }
                 let target_offset = hit.byte_range.start.saturating_sub(512);
-                if let Some(target) = self.active_view_id().and_then(|id| self.view_target(id)) {
-                    self.request_paged_viewport(
-                        target,
-                        ViewportAnchor::ByteOffset(target_offset),
-                        window,
-                        cx,
-                    );
-                };
+                self.request_paged_viewport(
+                    active_target,
+                    ViewportAnchor::ByteOffset(target_offset),
+                    window,
+                    cx,
+                );
             }
             _ => {}
         }
@@ -2033,7 +2122,17 @@ impl EditorWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(TabSlot::Editable(ed)) = self.active_slot() else {
+        let Some(active_slot) = self.active_slot() else {
+            return;
+        };
+        if matches!(active_slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support line endings."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = active_slot else {
             return;
         };
         let next = match ed.meta.line_ending {
@@ -2058,7 +2157,17 @@ impl EditorWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(TabSlot::Editable(ed)) = self.active_slot() else {
+        let Some(active_slot) = self.active_slot() else {
+            return;
+        };
+        if matches!(active_slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support text encodings."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = active_slot else {
             return;
         };
         let next = match ed.meta.encoding {
@@ -2081,7 +2190,17 @@ impl EditorWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(TabSlot::Editable(ed)) = self.active_slot() else {
+        let Some(active_slot) = self.active_slot() else {
+            return;
+        };
+        if matches!(active_slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support syntax languages."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = active_slot else {
             return;
         };
         let next = next_language(ed.language.id);
@@ -2126,8 +2245,9 @@ impl EditorWorkspace {
     }
 
     pub(crate) fn copy_paged_slice(&mut self, cx: &mut Context<Self>) {
-        if let Some(TabSlot::Paged(pv)) = self.active_slot()
-            && let Some(slice) = &pv.current_slice
+        if let Some(active_id) = self.active_view_id()
+            && let Some((_, vp)) = self.paged_view(active_id)
+            && let Some(slice) = &vp.current_slice
         {
             cx.write_to_clipboard(ClipboardItem::new_string(slice.text.to_string()));
             self.status_flash = Some((
@@ -2429,7 +2549,17 @@ impl EditorWorkspace {
         let Some(doc_id) = self.active_document_id() else {
             return;
         };
-        let Some(TabSlot::Editable(ed)) = self.documents.get_mut(&doc_id) else {
+        let Some(slot) = self.documents.get_mut(&doc_id) else {
+            return;
+        };
+        if matches!(slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support line endings."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = slot else {
             return;
         };
         match ed.set_line_ending(line_ending) {
@@ -2452,7 +2582,17 @@ impl EditorWorkspace {
         let Some(doc_id) = self.active_document_id() else {
             return;
         };
-        let Some(TabSlot::Editable(ed)) = self.documents.get_mut(&doc_id) else {
+        let Some(slot) = self.documents.get_mut(&doc_id) else {
+            return;
+        };
+        if matches!(slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support text encodings."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = slot else {
             return;
         };
         match ed.set_encoding(encoding) {
@@ -2524,10 +2664,20 @@ impl EditorWorkspace {
         if !self.mutation_allowed() {
             return;
         }
-        let Some(TabSlot::Editable(ed)) = self
+        let Some(slot) = self
             .active_document_id()
             .and_then(|id| self.documents.get_mut(&id))
         else {
+            return;
+        };
+        if matches!(slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support syntax languages."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = slot else {
             return;
         };
         if ed.set_language_override(language_id, window, cx) {
@@ -2660,6 +2810,19 @@ impl EditorWorkspace {
                 | PaletteCommandTarget::SetEncoding(_)
                 | PaletteCommandTarget::SetLanguageAuto
                 | PaletteCommandTarget::SetLanguage(_)
+                | PaletteCommandTarget::SplitAndCloneActiveViewRight
+                | PaletteCommandTarget::SplitAndCloneActiveViewDown
+                | PaletteCommandTarget::CloneActiveReadOnlyView
+                | PaletteCommandTarget::FormatJson
+                | PaletteCommandTarget::MinifyJson
+                | PaletteCommandTarget::ValidateJson
+                | PaletteCommandTarget::FormatJsonc
+                | PaletteCommandTarget::MinifyJsonc
+                | PaletteCommandTarget::ValidateJsonc
+                | PaletteCommandTarget::ImageZoomIn
+                | PaletteCommandTarget::ImageZoomOut
+                | PaletteCommandTarget::ImageZoomActualSize
+                | PaletteCommandTarget::ImageZoomFit
         );
         if document_command
             && origin
@@ -2834,6 +2997,75 @@ impl EditorWorkspace {
             }
             PaletteCommandTarget::SetLanguage(id) => {
                 self.set_active_language_override(Some(id), window, cx);
+            }
+            PaletteCommandTarget::SplitAndCloneActiveViewRight => {
+                self.split_and_clone_active_view(SplitDirection::Right, window, cx);
+            }
+            PaletteCommandTarget::SplitAndCloneActiveViewDown => {
+                self.split_and_clone_active_view(SplitDirection::Down, window, cx);
+            }
+            PaletteCommandTarget::CloneActiveReadOnlyView => {
+                self.clone_active_readonly_view_in_pane(window, cx);
+            }
+            PaletteCommandTarget::FormatJson => {
+                self.run_active_json_command(
+                    JsonDialect::Json,
+                    JsonCommandKind::Format,
+                    window,
+                    cx,
+                );
+            }
+            PaletteCommandTarget::MinifyJson => {
+                self.run_active_json_command(
+                    JsonDialect::Json,
+                    JsonCommandKind::Minify,
+                    window,
+                    cx,
+                );
+            }
+            PaletteCommandTarget::ValidateJson => {
+                self.run_active_json_command(
+                    JsonDialect::Json,
+                    JsonCommandKind::Validate,
+                    window,
+                    cx,
+                );
+            }
+            PaletteCommandTarget::FormatJsonc => {
+                self.run_active_json_command(
+                    JsonDialect::Jsonc,
+                    JsonCommandKind::Format,
+                    window,
+                    cx,
+                );
+            }
+            PaletteCommandTarget::MinifyJsonc => {
+                self.run_active_json_command(
+                    JsonDialect::Jsonc,
+                    JsonCommandKind::Minify,
+                    window,
+                    cx,
+                );
+            }
+            PaletteCommandTarget::ValidateJsonc => {
+                self.run_active_json_command(
+                    JsonDialect::Jsonc,
+                    JsonCommandKind::Validate,
+                    window,
+                    cx,
+                );
+            }
+            PaletteCommandTarget::ImageZoomIn => {
+                self.zoom_active_image(ImageZoomAction::In, window, cx);
+            }
+            PaletteCommandTarget::ImageZoomOut => {
+                self.zoom_active_image(ImageZoomAction::Out, window, cx);
+            }
+            PaletteCommandTarget::ImageZoomActualSize => {
+                self.zoom_active_image(ImageZoomAction::ActualSize, window, cx);
+            }
+            PaletteCommandTarget::ImageZoomFit => {
+                self.zoom_active_image(ImageZoomAction::Fit, window, cx);
             }
         }
         cx.notify();
@@ -3297,6 +3529,418 @@ impl EditorWorkspace {
     ) {
         self.set_active_language_override(Some("make"), w, cx);
     }
+
+    pub(crate) fn on_split_and_clone_active_view_right(
+        &mut self,
+        _: &SplitAndCloneActiveViewRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.split_and_clone_active_view(SplitDirection::Right, window, cx);
+    }
+
+    pub(crate) fn on_split_and_clone_active_view_down(
+        &mut self,
+        _: &SplitAndCloneActiveViewDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.split_and_clone_active_view(SplitDirection::Down, window, cx);
+    }
+
+    pub(crate) fn on_clone_active_readonly_view(
+        &mut self,
+        _: &CloneActiveReadOnlyView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clone_active_readonly_view_in_pane(window, cx);
+    }
+
+    pub(crate) fn on_format_json(
+        &mut self,
+        _: &FormatJson,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_active_json_command(JsonDialect::Json, JsonCommandKind::Format, window, cx);
+    }
+
+    pub(crate) fn on_minify_json(
+        &mut self,
+        _: &MinifyJson,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_active_json_command(JsonDialect::Json, JsonCommandKind::Minify, window, cx);
+    }
+
+    pub(crate) fn on_validate_json(
+        &mut self,
+        _: &ValidateJson,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_active_json_command(JsonDialect::Json, JsonCommandKind::Validate, window, cx);
+    }
+
+    pub(crate) fn on_format_jsonc(
+        &mut self,
+        _: &FormatJsonc,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_active_json_command(JsonDialect::Jsonc, JsonCommandKind::Format, window, cx);
+    }
+
+    pub(crate) fn on_minify_jsonc(
+        &mut self,
+        _: &MinifyJsonc,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_active_json_command(JsonDialect::Jsonc, JsonCommandKind::Minify, window, cx);
+    }
+
+    pub(crate) fn on_validate_jsonc(
+        &mut self,
+        _: &ValidateJsonc,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_active_json_command(JsonDialect::Jsonc, JsonCommandKind::Validate, window, cx);
+    }
+
+    pub(crate) fn on_image_zoom_in(
+        &mut self,
+        _: &ImageZoomIn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_active_image(ImageZoomAction::In, window, cx);
+    }
+
+    pub(crate) fn on_image_zoom_out(
+        &mut self,
+        _: &ImageZoomOut,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_active_image(ImageZoomAction::Out, window, cx);
+    }
+
+    pub(crate) fn on_image_zoom_actual_size(
+        &mut self,
+        _: &ImageZoomActualSize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_active_image(ImageZoomAction::ActualSize, window, cx);
+    }
+
+    pub(crate) fn on_image_zoom_fit(
+        &mut self,
+        _: &ImageZoomFit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_active_image(ImageZoomAction::Fit, window, cx);
+    }
+
+    pub fn run_active_json_command(
+        &mut self,
+        dialect: JsonDialect,
+        kind: JsonCommandKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_lifecycle_busy() {
+            return;
+        }
+        let Some(target) = self.active_view_id().and_then(|id| self.view_target(id)) else {
+            return;
+        };
+        let Some(active_slot) = self.active_slot() else {
+            return;
+        };
+        if matches!(active_slot, TabSlot::Image(_)) {
+            window.push_notification(
+                Notification::info("Read-only image preview does not support JSON tools."),
+                cx,
+            );
+            return;
+        }
+        let TabSlot::Editable(ed) = active_slot else {
+            window.push_notification(
+                Notification::info("JSON tools require an active Editable document."),
+                cx,
+            );
+            return;
+        };
+        if matches!(kind, JsonCommandKind::Format | JsonCommandKind::Minify) && ed.is_readonly() {
+            window.push_notification(
+                Notification::warning(
+                    "Document is read-only; formatting/minification disabled (Validate is available).",
+                ),
+                cx,
+            );
+            return;
+        }
+        if ed.has_pending_native_edit(cx) {
+            window.push_notification(
+                Notification::info(
+                    "Wait for the active edit commit to settle before running JSON tools.",
+                ),
+                cx,
+            );
+            return;
+        }
+        let byte_len = ed.committed_byte_len();
+        if byte_len > MAX_JSON_TOOL_BYTES as u64 {
+            window.push_notification(
+                Notification::warning(format!(
+                    "Document ({}) exceeds the {} JSON tool limit.",
+                    format_bytes(byte_len),
+                    format_bytes(MAX_JSON_TOOL_BYTES as u64),
+                )),
+                cx,
+            );
+            return;
+        }
+
+        let prefs = self.current_view_prefs();
+        let indent = if prefs.hard_tabs {
+            JsonIndent::Tabs
+        } else {
+            JsonIndent::Spaces(prefs.tab_size)
+        };
+        let line_ending = ed.meta.line_ending;
+        let rope = ed.committed_rope().clone();
+        let base_rev = ed.visible_revision;
+        let doc_id = ed.doc_id;
+        let lifecycle_gen = ed.lifecycle_gen;
+        let dialect_label = match dialect {
+            JsonDialect::Json => "JSON",
+            JsonDialect::Jsonc => "JSONC",
+        };
+
+        cx.spawn_in(window, async move |weak, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    match kind {
+                        JsonCommandKind::Validate => {
+                            let text = rope.to_string();
+                            validate_json_str(&text, dialect).map(JsonJobResult::Validated)
+                        }
+                        JsonCommandKind::Format => plan_rope_transform(
+                            &rope,
+                            dialect,
+                            JsonTransformMode::Format,
+                            indent,
+                            line_ending,
+                        )
+                        .map(|edit| JsonJobResult::Transformed {
+                            edit,
+                            is_format: true,
+                        }),
+                        JsonCommandKind::Minify => plan_rope_transform(
+                            &rope,
+                            dialect,
+                            JsonTransformMode::Minify,
+                            indent,
+                            line_ending,
+                        )
+                        .map(|edit| JsonJobResult::Transformed {
+                            edit,
+                            is_format: false,
+                        }),
+                    }
+                })
+                .await;
+
+            let _ = weak.update_in(cx, |this, window, cx| {
+                if this.shutting_down
+                    || this.is_lifecycle_busy()
+                    || this.session.resolve(target).is_err()
+                {
+                    return;
+                }
+                let is_active_view = this.active_view_id() == Some(target.view_id);
+                let Some(TabSlot::Editable(ed)) = this.documents.get_mut(&doc_id) else {
+                    return;
+                };
+                if ed.lifecycle_gen != lifecycle_gen
+                    || ed.visible_revision != base_rev
+                    || ed.has_pending_native_edit(cx)
+                {
+                    window.push_notification(
+                        Notification::info(format!(
+                            "{dialect_label} tool cancelled because the document changed."
+                        )),
+                        cx,
+                    );
+                    return;
+                }
+
+                match outcome {
+                    Ok(JsonJobResult::Validated(summary)) => {
+                        this.status_flash = Some((
+                            format!(
+                                "Valid {dialect_label} ({} tokens, depth {})",
+                                summary.token_count, summary.max_depth,
+                            ),
+                            Instant::now(),
+                        ));
+                        cx.notify();
+                    }
+                    Ok(JsonJobResult::Transformed {
+                        edit: None,
+                        is_format,
+                    }) => {
+                        let verb = if is_format { "formatted" } else { "minified" };
+                        this.status_flash = Some((
+                            format!("{dialect_label}: already {verb}"),
+                            Instant::now(),
+                        ));
+                        cx.notify();
+                    }
+                    Ok(JsonJobResult::Transformed {
+                        edit: Some((range, replacement)),
+                        is_format,
+                    }) => {
+                        let verb = if is_format { "formatted" } else { "minified" };
+                        match this.apply_view_atomic_edits(
+                            target,
+                            base_rev,
+                            &[(range, replacement)],
+                            window,
+                            cx,
+                        ) {
+                            Ok(_) => {
+                                this.status_flash =
+                                    Some((format!("{dialect_label} {verb}"), Instant::now()));
+                                cx.notify();
+                            }
+                            Err(err) => {
+                                window.push_notification(
+                                    Notification::warning(format!(
+                                        "Could not apply {dialect_label} edit: {err:?}"
+                                    )),
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                    Err(JsonError::ByteBudgetExceeded { bytes, max_bytes }) => {
+                        window.push_notification(
+                            Notification::warning(format!(
+                                "{dialect_label} limit exceeded ({bytes} B > {max_bytes} B)."
+                            )),
+                            cx,
+                        );
+                    }
+                    Err(JsonError::Syntax {
+                        message,
+                        byte_offset,
+                        line_1based,
+                        col_1based,
+                    }) => {
+                        if is_active_view {
+                            let max_len = usize::try_from(ed.committed_byte_len())
+                                .unwrap_or(usize::MAX);
+                            let clamped = byte_offset.min(max_len);
+                            ed.jump_to_byte_range(clamped..clamped, window, cx);
+                        }
+                        window.push_notification(
+                            Notification::warning(format!(
+                                "{dialect_label} error at Ln {line_1based}, Col {col_1based}: {message}"
+                            )),
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn zoom_active_image(
+        &mut self,
+        action: ImageZoomAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_id) = self.active_view_id() else {
+            return;
+        };
+        if !matches!(self.active_slot(), Some(TabSlot::Image(_))) {
+            window.push_notification(
+                Notification::info("Image zoom requires an active image preview tab."),
+                cx,
+            );
+            return;
+        }
+        let pane_id = self.active_pane_id();
+        self.zoom_image_view(pane_id, active_id, action, cx);
+    }
+
+    pub(crate) fn zoom_image_view(
+        &mut self,
+        pane_id: PaneId,
+        view_id: ViewId,
+        action: ImageZoomAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(TabSlot::Image(img)) = self.view_slot(view_id) else {
+            return;
+        };
+        let (img_w, img_h) = (img.width, img.height);
+        let (avail_w, avail_h) = self
+            .observed_pane_body_bounds(pane_id)
+            .map(|b| {
+                let w = f32::from(b.size.width).max(120.0);
+                let h = (f32::from(b.size.height) - 36.0).max(120.0);
+                (w, h)
+            })
+            .unwrap_or((800.0, 600.0));
+        let (_, _, fit_pct) =
+            ImageZoomMode::Fit.compute_display_size(img_w, img_h, avail_w, avail_h);
+
+        let vp = self.image_viewports.entry(view_id).or_default();
+        vp.zoom = match action {
+            ImageZoomAction::In => vp.zoom.zoom_in(Some(fit_pct)),
+            ImageZoomAction::Out => vp.zoom.zoom_out(Some(fit_pct)),
+            ImageZoomAction::ActualSize => ImageZoomMode::Percent(100),
+            ImageZoomAction::Fit => ImageZoomMode::Fit,
+        };
+        self.capture_view(view_id, cx);
+        self.persist_session_layout(cx);
+        cx.notify();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonCommandKind {
+    Format,
+    Minify,
+    Validate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageZoomAction {
+    In,
+    Out,
+    ActualSize,
+    Fit,
+}
+
+enum JsonJobResult {
+    Validated(crate::json_tools::JsonValidationSummary),
+    Transformed {
+        edit: Option<(std::ops::Range<usize>, String)>,
+        is_format: bool,
+    },
 }
 
 // Keep unused `Enter` import check clean if referenced in render layer.

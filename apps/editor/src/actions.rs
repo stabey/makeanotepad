@@ -97,6 +97,19 @@ gpui_kit::actions!(
         ToggleFocusActivePane,
         CloseActivePane,
         CloseActivePaneTabs,
+        SplitAndCloneActiveViewRight,
+        SplitAndCloneActiveViewDown,
+        CloneActiveReadOnlyView,
+        FormatJson,
+        MinifyJson,
+        ValidateJson,
+        FormatJsonc,
+        MinifyJsonc,
+        ValidateJsonc,
+        ImageZoomIn,
+        ImageZoomOut,
+        ImageZoomActualSize,
+        ImageZoomFit,
     ]
 );
 
@@ -301,6 +314,14 @@ pub fn register_bindings_and_menus(cx: &mut gpui_kit::App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-alt-\\", SplitPaneLeft, None),
         #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-shift-l", SplitAndCloneActiveViewRight, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-shift-l", SplitAndCloneActiveViewRight, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-shift-j", SplitAndCloneActiveViewDown, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-shift-j", SplitAndCloneActiveViewDown, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-alt-shift-\\", SplitPaneUp, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-alt-shift-\\", SplitPaneUp, None),
@@ -432,6 +453,20 @@ pub fn register_bindings_and_menus(cx: &mut gpui_kit::App) {
             MenuItem::separator(),
             MenuItem::action("Next Tab", NextTab),
             MenuItem::action("Previous Tab", PrevTab),
+            MenuItem::separator(),
+            MenuItem::action("Image Zoom In", ImageZoomIn),
+            MenuItem::action("Image Zoom Out", ImageZoomOut),
+            MenuItem::action("Image Actual Size (100%)", ImageZoomActualSize),
+            MenuItem::action("Fit Image to Pane", ImageZoomFit),
+        ]),
+        Menu::new("Tools").items([
+            MenuItem::action("Format JSON", FormatJson),
+            MenuItem::action("Minify JSON", MinifyJson),
+            MenuItem::action("Validate JSON", ValidateJson),
+            MenuItem::separator(),
+            MenuItem::action("Format JSONC", FormatJsonc),
+            MenuItem::action("Minify JSONC (Strip Comments)", MinifyJsonc),
+            MenuItem::action("Validate JSONC", ValidateJsonc),
         ]),
         Menu::new("Groups").items([
             MenuItem::action("New Group from Active Tab…", CreateGroupFromActiveTab),
@@ -471,6 +506,16 @@ pub fn register_bindings_and_menus(cx: &mut gpui_kit::App) {
             MenuItem::action("Split & Move Tab Down", SplitAndMoveActiveTabDown),
             MenuItem::action("Split & Move Tab Left", SplitAndMoveActiveTabLeft),
             MenuItem::action("Split & Move Tab Up", SplitAndMoveActiveTabUp),
+            MenuItem::separator(),
+            MenuItem::action(
+                "Split Right (Clone Read-Only View)",
+                SplitAndCloneActiveViewRight,
+            ),
+            MenuItem::action(
+                "Split Down (Clone Read-Only View)",
+                SplitAndCloneActiveViewDown,
+            ),
+            MenuItem::action("Duplicate Read-Only View in Pane", CloneActiveReadOnlyView),
             MenuItem::separator(),
             MenuItem::action("Focus Next Pane", FocusNextPane),
             MenuItem::action("Focus Previous Pane", FocusPrevPane),

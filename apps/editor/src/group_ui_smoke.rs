@@ -35,6 +35,7 @@ enum SlotVariantTag {
     Dehydrated,
     Hydrating,
     Paged,
+    Image,
     OverBudgetDraft,
     Failed,
 }
@@ -79,6 +80,7 @@ fn slot_tag(slot: &TabSlot) -> SlotVariantTag {
         TabSlot::Dehydrated(_) => SlotVariantTag::Dehydrated,
         TabSlot::Hydrating { .. } => SlotVariantTag::Hydrating,
         TabSlot::Paged(_) => SlotVariantTag::Paged,
+        TabSlot::Image(_) => SlotVariantTag::Image,
         TabSlot::OverBudgetDraft { .. } => SlotVariantTag::OverBudgetDraft,
         TabSlot::Failed { .. } => SlotVariantTag::Failed,
     }

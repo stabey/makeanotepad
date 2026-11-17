@@ -2179,6 +2179,125 @@ fn real_save_intent_captures_request_format_without_reverting_newer_metadata() {
     receive(admit(|| service.shutdown()));
 }
 
+#[test]
+fn open_document_routes_raster_images_over_budget_and_falls_back_on_corrupt_headers() {
+    let dir = TempDir::new().unwrap();
+    let paging = PagingService::default();
+
+    // Valid PNG -> OpenOutcome::Image(Ready)
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&64u32.to_be_bytes());
+    png.extend_from_slice(&32u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    let png_path = dir.path().join("valid.png");
+    fs::write(&png_path, &png).unwrap();
+    match admit(|| {
+        open_document(
+            DocumentId::new(),
+            &png_path,
+            &paging,
+            OpenOptions::default(),
+            &CancelToken::new(),
+        )
+    }) {
+        OpenOutcome::Image(ImageOpenOutcome::Ready { info, bytes, .. }) => {
+            assert_eq!(info.format, RasterImageFormat::Png);
+            assert_eq!((info.width, info.height, info.frames), (64, 32, 1));
+            assert_eq!(&*bytes, png.as_slice());
+        }
+        other => panic!("expected Ready image, got {other:?}"),
+    }
+
+    // 20000x20000 decompression bomb -> OpenOutcome::Image(OverBudget)
+    let mut bomb = Vec::new();
+    bomb.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    bomb.extend_from_slice(&13u32.to_be_bytes());
+    bomb.extend_from_slice(b"IHDR");
+    bomb.extend_from_slice(&20_000u32.to_be_bytes());
+    bomb.extend_from_slice(&20_000u32.to_be_bytes());
+    bomb.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    let bomb_path = dir.path().join("bomb.png");
+    {
+        let mut f = fs::File::create(&bomb_path).unwrap();
+        use std::io::Write;
+        f.write_all(&bomb).unwrap();
+        f.set_len(8 * 1024 * 1024).unwrap();
+    }
+    assert!(matches!(
+        admit(|| open_document(
+            DocumentId::new(),
+            &bomb_path,
+            &paging,
+            OpenOptions::default(),
+            &CancelToken::new()
+        )),
+        OpenOutcome::Image(ImageOpenOutcome::OverBudget { .. })
+    ));
+
+    // > 32 MiB image -> OpenOutcome::Image(OverBudget)
+    let huge_path = dir.path().join("huge.png");
+    {
+        let mut f = fs::File::create(&huge_path).unwrap();
+        use std::io::Write;
+        f.write_all(&png).unwrap();
+        f.set_len(MAX_IMAGE_FILE_BYTES + 4096).unwrap();
+    }
+    assert!(matches!(
+        admit(|| open_document(
+            DocumentId::new(),
+            &huge_path,
+            &paging,
+            OpenOptions::default(),
+            &CancelToken::new()
+        )),
+        OpenOutcome::Image(ImageOpenOutcome::OverBudget { .. })
+    ));
+
+    // Corrupt PNG magic + truncated NUL header falls back safely to Paged BinaryContent
+    let corrupt_path = dir.path().join("corrupt.png");
+    fs::write(&corrupt_path, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+    assert!(matches!(
+        admit(|| open_document(
+            DocumentId::new(),
+            &corrupt_path,
+            &paging,
+            OpenOptions::default(),
+            &CancelToken::new()
+        )),
+        OpenOutcome::Paged {
+            readonly_reason: ReadOnlyReason::BinaryContent,
+            ..
+        }
+    ));
+
+    // Plain text starting with "BM" and SVG/XML remain Editable
+    for (name, content) in [
+        ("note.txt", "BM hello world\nplain utf8 text\n"),
+        (
+            "icon.svg",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        ),
+    ] {
+        let p = dir.path().join(name);
+        fs::write(&p, content).unwrap();
+        match admit(|| {
+            open_document(
+                DocumentId::new(),
+                &p,
+                &paging,
+                OpenOptions::default(),
+                &CancelToken::new(),
+            )
+        }) {
+            OpenOutcome::Editable { rope, .. } => assert_eq!(rope, content),
+            other => panic!("expected Editable for {name}, got {other:?}"),
+        }
+    }
+}
+
 #[path = "support/session_groups.rs"]
 mod session_groups;
 #[path = "support/session_splits.rs"]

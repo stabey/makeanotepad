@@ -10,7 +10,7 @@ pub const MAX_GROUP_NAME_BYTES: usize = 128;
 pub const MAX_SESSION_VIEWS: usize = 1024;
 pub const MAX_LAYOUT_TREE_BYTES: usize = 512 * 1024;
 pub const MAX_METADATA_DECODE_BYTES: usize = 64 * 1024;
-pub const LAYOUT_FORMAT_VERSION: u32 = 2;
+pub const LAYOUT_FORMAT_VERSION: u32 = 3;
 pub const MAX_PANES: usize = 8;
 pub const MAX_LAYOUT_NODES: usize = 15;
 pub const MIN_SPLIT_RATIO_BPS: u16 = 500;
@@ -447,6 +447,23 @@ impl SessionLayout {
     pub fn view_count(&self) -> usize {
         self.views.len()
     }
+    pub fn doc_view_count(&self, doc_id: DocumentId) -> usize {
+        self.views
+            .values()
+            .filter(|v| v.document.doc_id == doc_id)
+            .count()
+    }
+    pub fn views_for_doc(&self, doc_id: DocumentId) -> Vec<ViewTarget> {
+        self.view_ids()
+            .filter_map(|id| {
+                let view = self.views.get(&id)?;
+                (view.document.doc_id == doc_id).then_some(ViewTarget {
+                    view_id: id,
+                    document: view.document,
+                })
+            })
+            .collect()
+    }
     pub fn view_at_index(&self, mut index: usize) -> Option<(PaneId, ViewId)> {
         for pane in self.panes() {
             if index < pane.tabs.len() {
@@ -515,7 +532,8 @@ impl SessionLayout {
             return Err(invalid("missing active pane"));
         }
         let mut seen = HashSet::with_capacity(self.views.len());
-        let mut documents = HashSet::with_capacity(self.views.len());
+        let mut documents: HashMap<DocumentId, LifecycleGen> =
+            HashMap::with_capacity(self.views.len());
         for pane in self.panes() {
             if pane.tabs.is_empty() != pane.active_view.is_none()
                 || pane.active_view.is_some_and(|id| !pane.tabs.contains(&id))
@@ -525,12 +543,14 @@ impl SessionLayout {
             let mut previous = 0;
             for id in &pane.tabs {
                 let view = self.views.get(id).ok_or_else(|| invalid("missing view"))?;
-                if id.0 == 0
-                    || *id != view.id
-                    || !seen.insert(*id)
-                    || !documents.insert(view.document.doc_id)
+                if id.0 == 0 || *id != view.id || !seen.insert(*id) {
+                    return Err(invalid("duplicate or invalid view identity"));
+                }
+                if let Some(existing) =
+                    documents.insert(view.document.doc_id, view.document.lifecycle_gen)
+                    && existing != view.document.lifecycle_gen
                 {
-                    return Err(invalid("duplicate or invalid view/document identity"));
+                    return Err(invalid("conflicting document lifecycle across views"));
                 }
                 let position = *groups
                     .get(&view.group_id)
@@ -575,6 +595,25 @@ impl SessionLayout {
         position: Option<usize>,
         activate: bool,
     ) -> Result<(), ServiceError> {
+        self.insert_view_inner(pane_id, view, position, activate, false)
+    }
+    pub fn insert_shared_view(
+        &mut self,
+        pane_id: PaneId,
+        view: LayoutView,
+        position: Option<usize>,
+        activate: bool,
+    ) -> Result<(), ServiceError> {
+        self.insert_view_inner(pane_id, view, position, activate, true)
+    }
+    fn insert_view_inner(
+        &mut self,
+        pane_id: PaneId,
+        view: LayoutView,
+        position: Option<usize>,
+        activate: bool,
+        allow_shared_doc: bool,
+    ) -> Result<(), ServiceError> {
         let pane = self
             .pane(pane_id)
             .ok_or_else(|| stale("pane no longer exists"))?;
@@ -583,13 +622,24 @@ impl SessionLayout {
                 "session has 1024 views; close a view while keeping its stored draft first",
             ));
         }
-        if self.views.contains_key(&view.id)
-            || self
-                .views
-                .values()
-                .any(|v| v.document.doc_id == view.document.doc_id)
+        if view.id.0 == 0 || self.views.contains_key(&view.id) {
+            return Err(invalid(if allow_shared_doc {
+                "duplicate or invalid view identity"
+            } else {
+                "document already has a view"
+            }));
+        }
+        if let Some(existing) = self
+            .views
+            .values()
+            .find(|v| v.document.doc_id == view.document.doc_id)
         {
-            return Err(invalid("document already has a view"));
+            if !allow_shared_doc {
+                return Err(invalid("document already has a view"));
+            }
+            if existing.document.lifecycle_gen != view.document.lifecycle_gen {
+                return Err(invalid("conflicting document lifecycle across views"));
+            }
         }
         if self.group(view.group_id).is_none() {
             return Err(stale("group no longer exists"));
@@ -891,6 +941,47 @@ impl SessionLayout {
                 result.changed = true;
                 result.created_pane = Some(new_pane);
             }
+            PaneCommand::SplitAndClone {
+                pane,
+                direction,
+                source,
+                clone_view_id,
+                clone_view_state,
+            } => {
+                if self.pane(pane).is_none() {
+                    return Err(stale("pane no longer exists"));
+                }
+                if self.panes().count() >= MAX_PANES {
+                    return Err(invalid("at most 8 panes"));
+                }
+                let source_view = self.resolve(source)?.clone();
+                if clone_view_id.0 == 0 || self.views.contains_key(&clone_view_id) {
+                    return Err(invalid("duplicate or invalid view identity"));
+                }
+                if self.views.len() >= MAX_SESSION_VIEWS {
+                    return Err(invalid(
+                        "session has 1024 views; close a view while keeping its stored draft first",
+                    ));
+                }
+                let new_pane = PaneId::new();
+                self.tree.root.split_pane(pane, direction, new_pane);
+                self.views.insert(
+                    clone_view_id,
+                    LayoutView {
+                        id: clone_view_id,
+                        document: source_view.document,
+                        group_id: source_view.group_id,
+                        view: clone_view_state,
+                    },
+                );
+                let created = self.pane_mut(new_pane).unwrap();
+                created.tabs.push(clone_view_id);
+                created.active_view = Some(clone_view_id);
+                self.tree.active_pane = new_pane;
+                result.changed = true;
+                result.created_pane = Some(new_pane);
+                result.views_changed = true;
+            }
             PaneCommand::MoveView {
                 target,
                 source,
@@ -1004,6 +1095,13 @@ pub enum PaneCommand {
         pane: PaneId,
         direction: SplitDirection,
         moving: Option<PaneMove>,
+    },
+    SplitAndClone {
+        pane: PaneId,
+        direction: SplitDirection,
+        source: ViewTarget,
+        clone_view_id: ViewId,
+        clone_view_state: ViewState,
     },
     MoveView {
         target: ViewTarget,
@@ -1394,6 +1492,137 @@ mod tests {
             .unwrap_err()
             .kind,
             ErrorKind::Stale
+        );
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn shared_views_validate_lifecycle_and_split_and_clone_is_atomic() {
+        let mut l = SessionLayout::default();
+        let pane_a = l.active_pane_id();
+        let group = create(&mut l, "Images");
+        let first = add(&mut l, group);
+        assert_eq!(l.doc_view_count(first.document.doc_id), 1);
+        assert_eq!(l.views_for_doc(first.document.doc_id), vec![first]);
+
+        // insert_view still enforces single-view for standard callers.
+        assert_eq!(
+            l.insert_view(
+                pane_a,
+                LayoutView {
+                    id: ViewId::new(),
+                    document: first.document,
+                    group_id: group,
+                    view: ViewState::default(),
+                },
+                None,
+                false,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidInput
+        );
+
+        // insert_shared_view accepts matching lifecycle_gen and rejects conflicting lifecycle_gen.
+        let shared_id = ViewId::new();
+        l.insert_shared_view(
+            pane_a,
+            LayoutView {
+                id: shared_id,
+                document: first.document,
+                group_id: group,
+                view: ViewState {
+                    cursor_byte: 42,
+                    scroll_byte: 10,
+                },
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(l.doc_view_count(first.document.doc_id), 2);
+        assert_eq!(l.views_for_doc(first.document.doc_id).len(), 2);
+
+        let conflict = DocumentKey {
+            doc_id: first.document.doc_id,
+            lifecycle_gen: LifecycleGen(2),
+        };
+        assert_eq!(
+            l.insert_shared_view(
+                pane_a,
+                LayoutView {
+                    id: ViewId::new(),
+                    document: conflict,
+                    group_id: group,
+                    view: ViewState::default(),
+                },
+                None,
+                false,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidInput
+        );
+
+        let mut corrupted = l.clone();
+        corrupted.views.get_mut(&shared_id).unwrap().document = conflict;
+        assert_eq!(
+            corrupted.validate().unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+
+        // SplitAndClone clones document and group into a new active pane.
+        let clone_id = ViewId::new();
+        let clone_state = ViewState {
+            cursor_byte: 150,
+            scroll_byte: 75,
+        };
+        let res = l
+            .apply_pane_command(PaneCommand::SplitAndClone {
+                pane: pane_a,
+                direction: SplitDirection::Right,
+                source: first,
+                clone_view_id: clone_id,
+                clone_view_state: clone_state,
+            })
+            .unwrap();
+        assert!(res.changed);
+        assert!(res.views_changed);
+        let pane_b = res.created_pane.unwrap();
+        assert_eq!(l.active_pane_id(), pane_b);
+        assert_eq!(l.active_view_id(), Some(clone_id));
+        let cloned = l.view(clone_id).unwrap();
+        assert_eq!(cloned.document, first.document);
+        assert_eq!(cloned.group_id, group);
+        assert_eq!(cloned.view, clone_state);
+        assert_eq!(l.doc_view_count(first.document.doc_id), 3);
+        l.validate().unwrap();
+
+        // Duplicate clone_view_id and zero clone_view_id fail atomically.
+        let before = l.clone();
+        assert_eq!(
+            l.apply_pane_command(PaneCommand::SplitAndClone {
+                pane: pane_a,
+                direction: SplitDirection::Down,
+                source: first,
+                clone_view_id: clone_id,
+                clone_view_state: ViewState::default(),
+            })
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            l.apply_pane_command(PaneCommand::SplitAndClone {
+                pane: pane_a,
+                direction: SplitDirection::Down,
+                source: first,
+                clone_view_id: ViewId(0),
+                clone_view_state: ViewState::default(),
+            })
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidInput
         );
         assert_eq!(l, before);
     }

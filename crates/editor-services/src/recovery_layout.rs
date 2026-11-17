@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 const SCHEMA: &str = "
 CREATE TABLE layout_view_sets(id INTEGER PRIMARY KEY AUTOINCREMENT);
 CREATE TABLE layout_states(id INTEGER PRIMARY KEY AUTOINCREMENT, format_version INTEGER NOT NULL, tree BLOB NOT NULL, view_set INTEGER NOT NULL REFERENCES layout_view_sets(id));
-CREATE TABLE layout_views(view_set INTEGER NOT NULL REFERENCES layout_view_sets(id), view_id TEXT NOT NULL, doc TEXT NOT NULL REFERENCES documents(id), gen INTEGER NOT NULL, group_id TEXT NOT NULL, view_state TEXT NOT NULL, PRIMARY KEY(view_set,view_id), UNIQUE(view_set,doc));
+CREATE TABLE layout_views(view_set INTEGER NOT NULL REFERENCES layout_view_sets(id), view_id TEXT NOT NULL, doc TEXT NOT NULL REFERENCES documents(id), gen INTEGER NOT NULL, group_id TEXT NOT NULL, view_state TEXT NOT NULL, PRIMARY KEY(view_set,view_id));
 CREATE INDEX layout_views_doc ON layout_views(doc);
 CREATE TABLE layout_heads(slot TEXT PRIMARY KEY, layout_id INTEGER NOT NULL REFERENCES layout_states(id));
 CREATE TABLE preserved_layouts(layout_id INTEGER PRIMARY KEY REFERENCES layout_states(id), reason TEXT NOT NULL);
@@ -55,15 +55,43 @@ fn schema_version(conn: &Connection) -> Result<(i64, i64), ServiceError> {
         )?,
     ))
 }
+const REQUIRED_V2_V3_TABLES: [&str; 11] = [
+    "documents",
+    "recovery_heads",
+    "checkpoint_chunks",
+    "edit_transactions",
+    "save_intents",
+    "layout_view_sets",
+    "layout_states",
+    "layout_views",
+    "layout_heads",
+    "preserved_layouts",
+    "closed_views",
+];
 fn preflight(conn: &Connection) -> Result<(i64, i64), ServiceError> {
     let state = schema_version(conn)?;
-    if state.0 > 2 || state.0 < 0 || (state.0 == 0 && state.1 != 0) {
+    if state.0 > 3 || state.0 < 0 || (state.0 == 0 && state.1 != 0) {
         return Err(error(
             ErrorKind::Unsupported,
             "unknown recovery schema; database and WAL left untouched",
         ));
     }
-    if state.0 == 2 {
+    if matches!(state.0, 2 | 3) {
+        let tables: HashSet<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        if !REQUIRED_V2_V3_TABLES
+            .iter()
+            .all(|name| tables.contains(*name))
+        {
+            return Err(error(
+                ErrorKind::Unsupported,
+                "unknown recovery schema; database and WAL left untouched",
+            ));
+        }
         // At most the two restorable heads and 1025 bounded records per view set.
         // Corrupt supported-format bodies are handled by manifest preservation;
         // recognized future fields must refuse the read-only preflight instead.
@@ -273,12 +301,21 @@ pub(super) fn open_database(
                 let layout = migrate_legacy(&tx)?;
                 install_layout(&tx, &layout, None)?;
             }
-            2 => {}
+            2 => {
+                tx.execute_batch(
+                    "ALTER TABLE layout_views RENAME TO layout_views_v2_mig;\
+                     CREATE TABLE layout_views(view_set INTEGER NOT NULL REFERENCES layout_view_sets(id), view_id TEXT NOT NULL, doc TEXT NOT NULL REFERENCES documents(id), gen INTEGER NOT NULL, group_id TEXT NOT NULL, view_state TEXT NOT NULL, PRIMARY KEY(view_set,view_id));\
+                     INSERT INTO layout_views(view_set,view_id,doc,gen,group_id,view_state) SELECT view_set,view_id,doc,gen,group_id,view_state FROM layout_views_v2_mig;\
+                     DROP TABLE layout_views_v2_mig;\
+                     CREATE INDEX layout_views_doc ON layout_views(doc);",
+                )?;
+            }
+            3 => {}
             _ => return Err(error(ErrorKind::Unsupported, "unsupported recovery schema")),
         }
-        if current.0 < 2 {
+        if current.0 < 3 {
             faults.check(FaultPoint::RecoveryBeforeCommit)?;
-            tx.pragma_update(None, "user_version", 2)?;
+            tx.pragma_update(None, "user_version", 3)?;
         }
         tx.commit()?;
     }
@@ -481,6 +518,8 @@ fn load_layout(
             .ok_or_else(|| error(ErrorKind::Corrupt, "missing legacy pane"))?;
         value["active_pane"] = pane;
         value["format_version"] = LAYOUT_FORMAT_VERSION.into();
+    } else if version == 2 {
+        value["format_version"] = LAYOUT_FORMAT_VERSION.into();
     }
     let tree: LayoutTree = serde_json::from_value(value)?;
     let count: i64 = conn.query_row(
@@ -495,10 +534,20 @@ fn load_layout(
         ));
     }
     let mut views = HashMap::with_capacity(count as usize);
+    let mut seen_docs = (version < 3).then(|| HashSet::with_capacity(count as usize));
     let mut stmt = conn.prepare("SELECT CASE WHEN typeof(view_id)='text' AND LENGTH(CAST(view_id AS BLOB))=32 THEN view_id END,CASE WHEN typeof(doc)='text' AND LENGTH(CAST(doc AS BLOB))=32 THEN doc END,gen,CASE WHEN typeof(group_id)='text' AND LENGTH(CAST(group_id AS BLOB))=32 THEN group_id END,CASE WHEN typeof(view_state)='text' AND LENGTH(CAST(view_state AS BLOB))<=65536 THEN CAST(view_state AS BLOB) END FROM layout_views WHERE view_set=?1")?;
     let mut rows = stmt.query([set])?;
     while let Some(row) = rows.next()? {
         let id = ViewId::from_key(&row.get::<_, String>(0)?)?;
+        let doc_id = parse_id(&row.get::<_, String>(1)?)?;
+        if let Some(docs) = seen_docs.as_mut()
+            && !docs.insert(doc_id)
+        {
+            return Err(error(
+                ErrorKind::Corrupt,
+                "legacy layout contains duplicate document views",
+            ));
+        }
         let generation = sql_unsigned(row, 2)?;
         let json: Option<Vec<u8>> = row.get(4)?;
         let json = json.ok_or_else(|| {
@@ -514,7 +563,7 @@ fn load_layout(
             LayoutView {
                 id,
                 document: DocumentKey {
-                    doc_id: parse_id(&row.get::<_, String>(1)?)?,
+                    doc_id,
                     lifecycle_gen: LifecycleGen(generation),
                 },
                 group_id: GroupId::from_key(&row.get::<_, String>(3)?)?,
@@ -630,6 +679,7 @@ fn read_manifest(conn: &Connection, preserve: bool) -> Result<SessionManifest, S
         repaired_or_fallback |= !layout.views.is_empty();
     }
     let mut documents = Vec::with_capacity(layout.views.len());
+    let mut seen_docs = HashSet::with_capacity(layout.views.len());
     let mut removed = Vec::new();
     for id in layout.view_ids() {
         let view = &layout.views[&id];
@@ -643,7 +693,25 @@ fn read_manifest(conn: &Connection, preserve: bool) -> Result<SessionManifest, S
             continue;
         }
         match document_stub(conn, &key.doc_id.key()) {
-            Ok(stub) => documents.push(stub),
+            Ok(stub) => {
+                if !seen_docs.insert(key) {
+                    if stub.has_checkpoint || (!stub.meta.paged && !stub.meta.image_preview) {
+                        removed.push(ViewTarget {
+                            view_id: id,
+                            document: key,
+                        });
+                        warnings.push(RecoveryWarning {
+                            doc_id: Some(key.doc_id),
+                            message: format!(
+                                "Duplicate view {} collapsed for single-view editable draft",
+                                id.key()
+                            ),
+                        });
+                    }
+                } else {
+                    documents.push(stub);
+                }
+            }
             Err(e) => {
                 removed.push(ViewTarget {
                     view_id: id,
@@ -740,7 +808,11 @@ fn catalog_summary(
     let (closed,checkpoint,other):(u64,u64,u64)=conn.query_row(&format!("SELECT COALESCE(sum(typeof(d.state)='integer' AND d.state=1),0),COALESCE(sum(NOT(typeof(d.state)='integer' AND d.state=1) AND h.doc IS NOT NULL),0),COALESCE(sum(NOT(typeof(d.state)='integer' AND d.state=1) AND h.doc IS NULL),0) FROM documents d LEFT JOIN recovery_heads h ON h.doc=d.id WHERE {CATALOG_LIVE_DOCUMENT} AND ({eligible})"),[],|row|Ok((sql_unsigned(row,0)?,sql_unsigned(row,1)?,sql_unsigned(row,2)?)))?;
     let mut admitted = 0u16;
     let mut admitted_checkpoint = 0u64;
+    let mut seen_keys = HashSet::with_capacity(layout.views.len());
     for view in layout.views.values() {
+        if !seen_keys.insert(view.document) {
+            continue;
+        }
         let row:Option<(Option<u64>,bool,bool)>=conn.query_row("SELECT CASE WHEN typeof(d.gen)='integer' AND d.gen>=0 THEN d.gen END,CASE WHEN typeof(d.state)='integer' AND d.state=0 THEN 1 ELSE 0 END,EXISTS(SELECT 1 FROM recovery_heads h WHERE h.doc=d.id) FROM documents d WHERE d.id=?1",[view.document.doc_id.key()],|row|Ok((sql_optional_unsigned(row,0)?,row.get(1)?,row.get(2)?))).optional()?;
         if let Some((Some(generation), true, checkpoint)) = row {
             if generation == view.document.lifecycle_gen.0 {
@@ -1336,9 +1408,39 @@ pub(super) fn close_views(
             "close after-layout changes unrelated state",
         ));
     }
+    let remaining_in_after: HashSet<DocumentId> = batch
+        .after
+        .views
+        .values()
+        .map(|v| v.document.doc_id)
+        .collect();
+    let mut closing_last: HashMap<DocumentId, usize> = HashMap::new();
+    for (idx, entry) in batch.entries.iter().enumerate() {
+        let doc_id = entry.target.document.doc_id;
+        if remaining_in_after.contains(&doc_id) {
+            if matches!(entry.disposition, CloseDisposition::Discard { .. }) {
+                return Err(error(
+                    ErrorKind::InvalidInput,
+                    "cannot discard document while secondary views remain open",
+                ));
+            }
+            continue;
+        }
+        if let Some(prev_idx) = closing_last.insert(doc_id, idx)
+            && batch.entries[prev_idx].disposition != entry.disposition
+        {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "inconsistent close disposition for shared document",
+            ));
+        }
+    }
     let mut closed = Vec::new();
-    for entry in &batch.entries {
+    for (idx, entry) in batch.entries.iter().enumerate() {
         let view = before.resolve(entry.target)?;
+        if closing_last.get(&view.document.doc_id) != Some(&idx) {
+            continue;
+        }
         let id = view.document.doc_id.key();
         match entry.disposition {
             CloseDisposition::Discard { tombstone_gen } => {
@@ -1414,19 +1516,11 @@ pub(super) fn replace_view_document(
             "reload must bind a fresh document",
         ));
     }
-    let old = expected.views.get_mut(&replacement.target.view_id).unwrap();
-    old.document = staged.document;
-    old.view = staged.view.clone();
-    if expected != replacement.after {
-        return Err(error(
-            ErrorKind::InvalidInput,
-            "reload changes unrelated layout state",
-        ));
-    }
     let meta = &replacement.replacement.meta;
+    let is_readonly_multi = meta.paged || meta.image_preview;
     if meta.path.is_none()
         || meta.origin_fingerprint.is_none()
-        || (!meta.paged
+        || (!is_readonly_multi
             && (meta.saved_identity.is_none()
                 || meta.saved_encoding != Some(meta.encoding)
                 || meta.saved_line_ending != Some(meta.line_ending)))
@@ -1434,6 +1528,36 @@ pub(super) fn replace_view_document(
         return Err(error(
             ErrorKind::InvalidInput,
             "reload requires verified clean-disk metadata",
+        ));
+    }
+    if is_readonly_multi {
+        let doc_views = expected.views_for_doc(replacement.target.document.doc_id);
+        for view_target in doc_views {
+            let after_view = replacement
+                .after
+                .view(view_target.view_id)
+                .ok_or_else(|| error(ErrorKind::InvalidInput, "reload view missing"))?;
+            let old = expected.views.get_mut(&view_target.view_id).unwrap();
+            old.document = staged.document;
+            old.view = after_view.view;
+        }
+    } else {
+        let old = expected.views.get_mut(&replacement.target.view_id).unwrap();
+        old.document = staged.document;
+        old.view = staged.view;
+        let secondary: Vec<ViewTarget> = expected
+            .views_for_doc(replacement.target.document.doc_id)
+            .into_iter()
+            .filter(|t| t.view_id != replacement.target.view_id)
+            .collect();
+        if !secondary.is_empty() {
+            expected.remove_views(&secondary)?;
+        }
+    }
+    if expected != replacement.after {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "reload changes unrelated layout state",
         ));
     }
     let prior: Option<i64> = tx

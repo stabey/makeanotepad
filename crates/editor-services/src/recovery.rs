@@ -40,10 +40,10 @@ pub fn inspect_recovery_session(
 ) -> Result<(SessionManifest, ClosedViewPage), ServiceError> {
     let conn = read_only_snapshot(database)?;
     let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version != 2 {
+    if !matches!(version, 2 | 3) {
         return Err(ServiceError::new(
             ErrorKind::Unsupported,
-            "read-only reconciliation requires schema version 2",
+            "read-only reconciliation requires schema version 2 or 3",
         ));
     }
     Ok((
@@ -104,7 +104,7 @@ pub fn inspect_recovery_startup(
     }
     let archive_pair =
         names.contains("legacy_v1_windows_views") == names.contains("legacy_v1_session");
-    if version == 2
+    if matches!(version, 2 | 3)
         && base
             .iter()
             .chain(layout.iter())
@@ -112,6 +112,7 @@ pub fn inspect_recovery_startup(
         && archive_pair
         && !names.contains("windows_views")
         && !names.contains("session")
+        && !names.contains("layout_views_v2_mig")
     {
         return Ok(StartupRecoveryState::AfterImage {
             manifest: layout_store::read_only_manifest(&conn)?,
@@ -160,10 +161,10 @@ pub fn read_recovery_page(
 ) -> Result<RecoveryPage, ServiceError> {
     let conn = read_only_snapshot(database)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 2 {
+    if !matches!(version, 2 | 3) {
         return Err(ServiceError::new(
             ErrorKind::Unsupported,
-            "read-only catalog requires schema version 2",
+            "read-only catalog requires schema version 2 or 3",
         ));
     }
     layout_store::recovery_page(&conn, request)
@@ -175,10 +176,10 @@ pub fn read_recovery_draft(
 ) -> Result<HydratedDraft, ServiceError> {
     let conn = read_only_snapshot(database)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 2 {
+    if !matches!(version, 2 | 3) {
         return Err(ServiceError::new(
             ErrorKind::Unsupported,
-            "read-only hydration requires schema version 2",
+            "read-only hydration requires schema version 2 or 3",
         ));
     }
     hydrate(&conn, key, cancel)

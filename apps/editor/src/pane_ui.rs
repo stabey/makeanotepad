@@ -1144,6 +1144,8 @@ pub(crate) fn build_pane_options_menu(
         lifecycle_busy,
         can_split_h,
         can_split_v,
+        can_clone_readonly,
+        at_max_views,
         other_panes,
     ) = {
         let ws = workspace.read(cx);
@@ -1181,16 +1183,26 @@ pub(crate) fn build_pane_options_menu(
                 &|id, fb| ws.pane_split_ratio(id).unwrap_or(fb),
             )
             .is_ok();
+        let pane_target = ws.pane_active_target(pane_id);
+        let clone_readonly_ok = pane_target.is_some_and(|t| {
+            matches!(
+                ws.view_slot(t.view_id),
+                Some(crate::app::TabSlot::Paged(_) | crate::app::TabSlot::Image(_))
+            )
+        });
+        let views_at_limit = layout.views.len() >= editor_services::MAX_SESSION_VIEWS;
         (
             idx,
             total,
             pane.tabs.len(),
-            ws.pane_active_target(pane_id),
+            pane_target,
             ws.is_focus_only(),
             ws.is_compact_layout(),
             ws.is_lifecycle_busy(),
             ok_h,
             ok_v,
+            clone_readonly_ok,
+            views_at_limit,
             others,
         )
     };
@@ -1351,6 +1363,53 @@ pub(crate) fn build_pane_options_menu(
                         });
                     }),
             );
+
+        if can_clone_readonly {
+            let ws_cl_r = workspace.clone();
+            let ws_cl_d = workspace.clone();
+            let ws_cl_pane = workspace.clone();
+            m = m
+                .separator()
+                .item(
+                    PopupMenuItem::new("Split Right (New Read-Only View)")
+                        .disabled(lifecycle_busy || !can_split_h || at_max_views)
+                        .on_click(move |_, window, cx| {
+                            ws_cl_r.update(cx, |ws, cx| {
+                                ws.split_and_clone_view(
+                                    pane_id,
+                                    target,
+                                    SplitDirection::Right,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Split Down (New Read-Only View)")
+                        .disabled(lifecycle_busy || !can_split_v || at_max_views)
+                        .on_click(move |_, window, cx| {
+                            ws_cl_d.update(cx, |ws, cx| {
+                                ws.split_and_clone_view(
+                                    pane_id,
+                                    target,
+                                    SplitDirection::Down,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Duplicate Read-Only View in Pane")
+                        .disabled(lifecycle_busy || at_max_views)
+                        .on_click(move |_, window, cx| {
+                            ws_cl_pane.update(cx, |ws, cx| {
+                                ws.clone_readonly_view_in_pane(pane_id, target, window, cx);
+                            });
+                        }),
+                );
+        }
 
         if !other_panes.is_empty() {
             let ws_sub = workspace.clone();

@@ -329,7 +329,7 @@ fn legacy_overflow_is_archived_and_every_record_remains_keyset_browseable() {
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     receive(admit(|| service.shutdown()));
 }
@@ -386,14 +386,20 @@ fn migration_failure_rolls_back_schema_archives_version_and_payloads() {
 }
 #[test]
 fn future_wal_schema_and_nonempty_unversioned_database_are_untouched() {
-    for future in [false, true] {
+    for mode in [0, 1, 2] {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("db");
         let conn = Connection::open(&db).unwrap();
-        if future {
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(x'abcd'); PRAGMA user_version=3;").unwrap();
-        } else {
-            conn.execute_batch("CREATE TABLE unknown_payload(value); INSERT INTO unknown_payload VALUES('do not replace');").unwrap();
+        match mode {
+            0 => conn
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(x'abcd'); PRAGMA user_version=4;")
+                .unwrap(),
+            1 => conn
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(x'abcd'); PRAGMA user_version=3;")
+                .unwrap(),
+            _ => conn
+                .execute_batch("CREATE TABLE unknown_payload(value); INSERT INTO unknown_payload VALUES('do not replace');")
+                .unwrap(),
         }
         let before = disk_images(&db);
         assert_eq!(
@@ -2123,7 +2129,7 @@ fn legacy_non_text_and_invalid_utf8_payloads_are_preserved_and_isolated() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         let raw_active: (String, Vec<u8>) = connection.query_row(
             "SELECT typeof(value),CAST(value AS BLOB) FROM legacy_v1_session WHERE key='active'",
@@ -2260,7 +2266,7 @@ fn future_layout_fields_and_versions_refuse_before_wal_without_rewriting_snapsho
                     )
                     .unwrap();
             }
-            "schema" => connection.pragma_update(None, "user_version", 3).unwrap(),
+            "schema" => connection.pragma_update(None, "user_version", 4).unwrap(),
             "view" => {
                 let mut state: serde_json::Value =
                     serde_json::from_slice(&original.1[0].1).unwrap();
@@ -2331,7 +2337,7 @@ fn future_layout_fields_and_versions_refuse_before_wal_without_rewriting_snapsho
                 connection
                     .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                     .unwrap(),
-                if case == "schema" { 3 } else { 2 }
+                if case == "schema" { 4 } else { 3 }
             );
             assert_eq!(
                 connection
@@ -2699,4 +2705,913 @@ fn installing_over_a_healthy_current_preserves_or_refuses_a_damaged_previous_hea
         }
         receive(admit(|| service.shutdown()));
     }
+}
+
+#[test]
+fn v2_to_v3_migration_rebuilds_layout_views_and_rolls_back_on_fault() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("v2-mig.sqlite3");
+    let doc_id = DocumentId::new();
+    let doc_key = document_key(doc_id);
+    let paged_id = DocumentId::new();
+    let paged_key = document_key(paged_id);
+    let mut layout = SessionLayout::default();
+    let _edit_target = add_layout_view(
+        &mut layout,
+        doc_key,
+        ViewState {
+            cursor_byte: 5,
+            scroll_byte: 2,
+        },
+        true,
+    );
+    let paged_target = add_layout_view(
+        &mut layout,
+        paged_key,
+        ViewState {
+            cursor_byte: 64,
+            scroll_byte: 32,
+        },
+        false,
+    );
+    let mut tree_v2 = serde_json::to_value(&layout.tree).unwrap();
+    tree_v2["format_version"] = 2.into();
+    let tree_bytes = serde_json::to_vec(&tree_v2).unwrap();
+
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents(id TEXT PRIMARY KEY, gen INTEGER NOT NULL, state INTEGER NOT NULL, meta TEXT NOT NULL, saved_rev INTEGER NOT NULL DEFAULT -1, saved_meta TEXT);
+             CREATE TABLE recovery_heads(doc TEXT PRIMARY KEY REFERENCES documents(id), checkpoint_rev INTEGER NOT NULL, durable_rev INTEGER NOT NULL, byte_len INTEGER NOT NULL, checkpoint_hash BLOB NOT NULL, delta_bytes INTEGER NOT NULL DEFAULT 0, delta_rows INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE checkpoint_chunks(doc TEXT NOT NULL REFERENCES documents(id), rev INTEGER NOT NULL, ordinal INTEGER NOT NULL, content BLOB NOT NULL, checksum BLOB NOT NULL, PRIMARY KEY(doc,rev,ordinal));
+             CREATE TABLE edit_transactions(doc TEXT NOT NULL REFERENCES documents(id), base_rev INTEGER NOT NULL, new_rev INTEGER NOT NULL, deltas BLOB NOT NULL, checksum BLOB NOT NULL, PRIMARY KEY(doc,new_rev));
+             CREATE TABLE save_intents(doc TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE layout_view_sets(id INTEGER PRIMARY KEY AUTOINCREMENT);
+             CREATE TABLE layout_states(id INTEGER PRIMARY KEY AUTOINCREMENT, format_version INTEGER NOT NULL, tree BLOB NOT NULL, view_set INTEGER NOT NULL REFERENCES layout_view_sets(id));
+             CREATE TABLE layout_views(view_set INTEGER NOT NULL REFERENCES layout_view_sets(id), view_id TEXT NOT NULL, doc TEXT NOT NULL REFERENCES documents(id), gen INTEGER NOT NULL, group_id TEXT NOT NULL, view_state TEXT NOT NULL, PRIMARY KEY(view_set,view_id), UNIQUE(view_set,doc));
+             CREATE INDEX layout_views_doc ON layout_views(doc);
+             CREATE TABLE layout_heads(slot TEXT PRIMARY KEY, layout_id INTEGER NOT NULL REFERENCES layout_states(id));
+             CREATE TABLE preserved_layouts(layout_id INTEGER PRIMARY KEY REFERENCES layout_states(id), reason TEXT NOT NULL);
+             CREATE TABLE closed_views(close_id INTEGER PRIMARY KEY AUTOINCREMENT, view_id TEXT NOT NULL, doc TEXT UNIQUE NOT NULL REFERENCES documents(id), gen INTEGER NOT NULL, pane_id TEXT NOT NULL, group_id TEXT NOT NULL, position INTEGER NOT NULL, view_state TEXT NOT NULL, closed_order INTEGER NOT NULL);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        let edit_meta = DocMeta {
+            title: "v2 draft".into(),
+            ..DocMeta::default()
+        };
+        let paged_meta = DocMeta {
+            title: "v2 paged".into(),
+            paged: true,
+            ..DocMeta::default()
+        };
+        conn.execute(
+            "INSERT INTO documents(id,gen,state,meta) VALUES(?1,1,0,?2)",
+            params![
+                format!("{:032x}", doc_id.0),
+                serde_json::to_string(&edit_meta).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents(id,gen,state,meta) VALUES(?1,1,0,?2)",
+            params![
+                format!("{:032x}", paged_id.0),
+                serde_json::to_string(&paged_meta).unwrap()
+            ],
+        )
+        .unwrap();
+        let bytes = b"v2 checkpoint payload";
+        let hash = blake3::hash(bytes);
+        conn.execute(
+            "INSERT INTO recovery_heads(doc,checkpoint_rev,durable_rev,byte_len,checkpoint_hash) VALUES(?1,1,1,?2,?3)",
+            params![format!("{:032x}", doc_id.0), bytes.len() as i64, hash.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_chunks(doc,rev,ordinal,content,checksum) VALUES(?1,1,0,?2,?3)",
+            params![
+                format!("{:032x}", doc_id.0),
+                bytes.as_slice(),
+                hash.as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO layout_view_sets DEFAULT VALUES", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        for (view_id, doc, view) in [
+            (
+                layout
+                    .views
+                    .values()
+                    .find(|v| v.document == doc_key)
+                    .unwrap()
+                    .id,
+                doc_id,
+                ViewState {
+                    cursor_byte: 5,
+                    scroll_byte: 2,
+                },
+            ),
+            (
+                paged_target.view_id,
+                paged_id,
+                ViewState {
+                    cursor_byte: 64,
+                    scroll_byte: 32,
+                },
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO layout_views(view_set,view_id,doc,gen,group_id,view_state) VALUES(?1,?2,?3,1,?4,?5)",
+                params![
+                    set_id,
+                    view_id.key(),
+                    format!("{:032x}", doc.0),
+                    GroupId::UNGROUPED.key(),
+                    serde_json::to_string(&view).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO layout_states(format_version,tree,view_set) VALUES(2,?1,?2)",
+            params![tree_bytes, set_id],
+        )
+        .unwrap();
+        let layout_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO layout_heads(slot,layout_id) VALUES('current',?1)",
+            [layout_id],
+        )
+        .unwrap();
+    }
+
+    // Read-only v2 inspection works prior to opening a writer.
+    assert!(matches!(
+        inspect_recovery_startup(&db).unwrap(),
+        StartupRecoveryState::AfterImage { .. }
+    ));
+    let (v2_manifest, _) = inspect_recovery_session(&db).unwrap();
+    assert_eq!(v2_manifest.layout, layout);
+    assert_eq!(
+        read_recovery_page(
+            &db,
+            RecoveryPageRequest {
+                cursor: None,
+                limit: 16
+            }
+        )
+        .unwrap()
+        .summary
+        .admitted,
+        2
+    );
+    assert_eq!(
+        read_recovery_draft(&db, doc_key, &CancelToken::new())
+            .unwrap()
+            .rope,
+        "v2 checkpoint payload"
+    );
+
+    // Fault during v2 -> v3 migration rolls back atomically.
+    let before = disk_images(&db);
+    let faults = FaultInjector::default();
+    faults.arm(FaultPoint::RecoveryBeforeCommit);
+    assert_eq!(start_error(&db, faults).kind, ErrorKind::Injected);
+    assert_eq!(disk_images(&db), before);
+    {
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='layout_views_v2_mig'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    // Open without fault upgrades schema to v3 and removes UNIQUE(view_set, doc).
+    let service = RecoveryHandle::start(&db).unwrap();
+    let manifest = receive(service.request_manifest().unwrap());
+    assert_eq!(manifest.layout, layout);
+    assert_eq!(manifest.layout.tree.format_version, 3);
+    assert!(!manifest.repaired_or_fallback);
+
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='layout_views_v2_mig'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='layout_views_doc'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+
+    // Multi-view layout for paged document can now be persisted on migrated v3 DB.
+    let mut updated = manifest.layout.clone();
+    let clone_id = ViewId::new();
+    updated
+        .apply_pane_command(PaneCommand::SplitAndClone {
+            pane: updated.active_pane_id(),
+            direction: SplitDirection::Right,
+            source: paged_target,
+            clone_view_id: clone_id,
+            clone_view_state: ViewState {
+                cursor_byte: 10,
+                scroll_byte: 4,
+            },
+        })
+        .unwrap();
+    persist_test_layout(&service, &updated, Vec::new());
+    receive(admit(|| service.shutdown()));
+
+    assert!(matches!(
+        inspect_recovery_startup(&db).unwrap(),
+        StartupRecoveryState::AfterImage { manifest, .. } if manifest.layout == updated
+    ));
+}
+
+#[test]
+fn multi_view_readonly_persistence_and_catalog_summary_deduplication() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("multi-view.sqlite3");
+    let service = RecoveryHandle::start(&db).unwrap();
+    let mut layout = receive(service.request_manifest().unwrap()).layout;
+    let pane_a = layout.active_pane_id();
+
+    let paged_key = document_key(DocumentId::new());
+    let image_key = document_key(DocumentId::new());
+    let edit_key = document_key(DocumentId::new());
+
+    let p1 = add_layout_view(
+        &mut layout,
+        paged_key,
+        ViewState {
+            cursor_byte: 10,
+            scroll_byte: 5,
+        },
+        true,
+    );
+    let i1 = add_layout_view(
+        &mut layout,
+        image_key,
+        ViewState {
+            cursor_byte: 100,
+            scroll_byte: 0,
+        },
+        false,
+    );
+    let _e1 = add_layout_view(
+        &mut layout,
+        edit_key,
+        ViewState {
+            cursor_byte: 3,
+            scroll_byte: 1,
+        },
+        false,
+    );
+
+    // SplitAndClone for paged doc -> pane_b
+    let p2_id = ViewId::new();
+    let split_res = layout
+        .apply_pane_command(PaneCommand::SplitAndClone {
+            pane: pane_a,
+            direction: SplitDirection::Right,
+            source: p1,
+            clone_view_id: p2_id,
+            clone_view_state: ViewState {
+                cursor_byte: 2048,
+                scroll_byte: 1024,
+            },
+        })
+        .unwrap();
+    let pane_b = split_res.created_pane.unwrap();
+
+    // Share image doc across pane_a and pane_b (3 views total for image_key)
+    let i2_id = ViewId::new();
+    let i3_id = ViewId::new();
+    layout
+        .insert_shared_view(
+            pane_b,
+            LayoutView {
+                id: i2_id,
+                document: image_key,
+                group_id: GroupId::UNGROUPED,
+                view: ViewState {
+                    cursor_byte: 200,
+                    scroll_byte: 0,
+                },
+            },
+            None,
+            false,
+        )
+        .unwrap();
+    layout
+        .insert_shared_view(
+            pane_a,
+            LayoutView {
+                id: i3_id,
+                document: image_key,
+                group_id: GroupId::UNGROUPED,
+                view: ViewState {
+                    cursor_byte: 50,
+                    scroll_byte: 0,
+                },
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+    persist_test_layout(
+        &service,
+        &layout,
+        vec![
+            DocumentChange::Create(DocumentMetaRecord {
+                key: paged_key,
+                meta: DocMeta {
+                    title: "large.log".into(),
+                    paged: true,
+                    ..DocMeta::default()
+                },
+            }),
+            DocumentChange::Create(DocumentMetaRecord {
+                key: image_key,
+                meta: DocMeta {
+                    title: "photo.png".into(),
+                    image_preview: true,
+                    ..DocMeta::default()
+                },
+            }),
+            DocumentChange::Create(DocumentMetaRecord {
+                key: edit_key,
+                meta: DocMeta {
+                    title: "notes.txt".into(),
+                    ..DocMeta::default()
+                },
+            }),
+        ],
+    );
+    receive(admit(|| service.shutdown()));
+    drop(service);
+
+    let (inspected, _) = inspect_recovery_session(&db).unwrap();
+    assert_eq!(inspected.layout, layout);
+    assert_eq!(inspected.layout.views.len(), 6);
+    assert_eq!(inspected.documents.len(), 3);
+    assert_eq!(
+        inspected.recovery,
+        RecoveryCatalogSummary {
+            total_eligible: 3,
+            admitted: 3,
+            unplaced_checkpoints: 0,
+            unplaced_other: 0,
+            closed: 0,
+        }
+    );
+
+    let page = read_recovery_page(
+        &db,
+        RecoveryPageRequest {
+            cursor: None,
+            limit: 64,
+        },
+    )
+    .unwrap();
+    assert_eq!(page.entries.len(), 3);
+    assert!(
+        page.entries
+            .iter()
+            .all(|e| e.category == RecoveryEntryCategory::Admitted)
+    );
+    let service = RecoveryHandle::start(&db).unwrap();
+    let restarted = receive(service.request_manifest().unwrap());
+    assert_eq!(restarted.layout, layout);
+    assert_eq!(restarted.documents.len(), 3);
+    assert_eq!(restarted.recovery, inspected.recovery);
+    assert_eq!(
+        restarted.layout.view(i1.view_id).unwrap().view.cursor_byte,
+        100
+    );
+    assert_eq!(restarted.layout.view(i2_id).unwrap().view.cursor_byte, 200);
+    assert_eq!(restarted.layout.view(p2_id).unwrap().view.cursor_byte, 2048);
+    receive(admit(|| service.shutdown()));
+}
+
+#[test]
+fn secondary_vs_last_close_views_enforces_shared_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("multi-close.sqlite3");
+    let service = RecoveryHandle::start(&db).unwrap();
+    let mut layout = receive(service.request_manifest().unwrap()).layout;
+    let pane = layout.active_pane_id();
+
+    let paged_key = document_key(DocumentId::new());
+    let image_key = document_key(DocumentId::new());
+    let p1 = add_layout_view(&mut layout, paged_key, ViewState::default(), true);
+    let p2 = ViewTarget {
+        view_id: ViewId::new(),
+        document: paged_key,
+    };
+    let p3 = ViewTarget {
+        view_id: ViewId::new(),
+        document: paged_key,
+    };
+    for p in [p2, p3] {
+        layout
+            .insert_shared_view(
+                pane,
+                LayoutView {
+                    id: p.view_id,
+                    document: paged_key,
+                    group_id: GroupId::UNGROUPED,
+                    view: ViewState::default(),
+                },
+                None,
+                false,
+            )
+            .unwrap();
+    }
+    let i1 = add_layout_view(&mut layout, image_key, ViewState::default(), false);
+    let i2 = ViewTarget {
+        view_id: ViewId::new(),
+        document: image_key,
+    };
+    layout
+        .insert_shared_view(
+            pane,
+            LayoutView {
+                id: i2.view_id,
+                document: image_key,
+                group_id: GroupId::UNGROUPED,
+                view: ViewState::default(),
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+    let mut rev = persist_test_layout(
+        &service,
+        &layout,
+        vec![
+            DocumentChange::Create(DocumentMetaRecord {
+                key: paged_key,
+                meta: DocMeta {
+                    title: "shared.log".into(),
+                    paged: true,
+                    ..DocMeta::default()
+                },
+            }),
+            DocumentChange::Create(DocumentMetaRecord {
+                key: image_key,
+                meta: DocMeta {
+                    title: "shared.png".into(),
+                    image_preview: true,
+                    ..DocMeta::default()
+                },
+            }),
+        ],
+    );
+
+    // 1. Secondary close with Discard must fail with InvalidInput.
+    let mut after_p1 = layout.clone();
+    after_p1.remove_views(&[p1]).unwrap();
+    let bad_discard = CloseBatch {
+        sequence: LayoutSeq(2),
+        expected_revision: rev,
+        entries: vec![CloseEntry {
+            disposition: CloseDisposition::Discard {
+                tombstone_gen: LifecycleGen(2),
+            },
+            ..entry(p1, None)
+        }],
+        after: after_p1.clone(),
+        empty_pane_document: None,
+    };
+    assert_eq!(
+        response(service.close_views(bad_discard).unwrap())
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidInput
+    );
+
+    // 2. Secondary close with KeepRecovery succeeds without closing document or writing closed_views.
+    let ack1 = receive(
+        service
+            .close_views(CloseBatch {
+                sequence: LayoutSeq(3),
+                expected_revision: rev,
+                entries: vec![entry(p1, None)],
+                after: after_p1.clone(),
+                empty_pane_document: None,
+            })
+            .unwrap(),
+    );
+    assert!(ack1.closed.is_empty());
+    rev = ack1.layout.revision;
+    layout = after_p1;
+
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM documents WHERE id=?1",
+            [format!("{:032x}", paged_key.doc_id.0)],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM closed_views", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    // 3. Batch closing p2 and p3 with inconsistent dispositions must fail.
+    let mut after_p23 = layout.clone();
+    after_p23.remove_views(&[p2, p3]).unwrap();
+    assert_eq!(
+        response(
+            service
+                .close_views(CloseBatch {
+                    sequence: LayoutSeq(4),
+                    expected_revision: rev,
+                    entries: vec![
+                        entry(p2, None),
+                        CloseEntry {
+                            disposition: CloseDisposition::Discard {
+                                tombstone_gen: LifecycleGen(2)
+                            },
+                            ..entry(p3, None)
+                        },
+                    ],
+                    after: after_p23.clone(),
+                    empty_pane_document: None,
+                })
+                .unwrap()
+        )
+        .unwrap_err()
+        .kind,
+        ErrorKind::InvalidInput
+    );
+
+    // 4. Batch closing p2 and p3 with KeepRecovery closes document once using last entry (p3).
+    let p3_view = ViewState {
+        cursor_byte: 4096,
+        scroll_byte: 2048,
+    };
+    let ack2 = receive(
+        service
+            .close_views(CloseBatch {
+                sequence: LayoutSeq(5),
+                expected_revision: rev,
+                entries: vec![
+                    entry(p2, None),
+                    CloseEntry {
+                        view: p3_view,
+                        ..entry(p3, None)
+                    },
+                ],
+                after: after_p23.clone(),
+                empty_pane_document: None,
+            })
+            .unwrap(),
+    );
+    assert_eq!(ack2.closed.len(), 1);
+    assert_eq!(ack2.closed[0].previous_view.id, p3.view_id);
+    assert_eq!(ack2.closed[0].previous_view.view, p3_view);
+    rev = ack2.layout.revision;
+    layout = after_p23;
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM documents WHERE id=?1",
+            [format!("{:032x}", paged_key.doc_id.0)],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT view_id FROM closed_views", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        p3.view_id.key()
+    );
+
+    // 5. Batch closing i1 and i2 with Discard tombstones image_key once.
+    let mut after_i12 = layout.clone();
+    after_i12.remove_views(&[i1, i2]).unwrap();
+    let ack3 = receive(
+        service
+            .close_views(CloseBatch {
+                sequence: LayoutSeq(6),
+                expected_revision: rev,
+                entries: vec![
+                    CloseEntry {
+                        disposition: CloseDisposition::Discard {
+                            tombstone_gen: LifecycleGen(2),
+                        },
+                        ..entry(i1, None)
+                    },
+                    CloseEntry {
+                        disposition: CloseDisposition::Discard {
+                            tombstone_gen: LifecycleGen(2),
+                        },
+                        ..entry(i2, None)
+                    },
+                ],
+                after: after_i12,
+                empty_pane_document: None,
+            })
+            .unwrap(),
+    );
+    assert!(ack3.closed.is_empty());
+    assert_eq!(
+        conn.query_row(
+            "SELECT gen,state FROM documents WHERE id=?1",
+            [format!("{:032x}", image_key.doc_id.0)],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        )
+        .unwrap(),
+        (2, 2)
+    );
+    receive(admit(|| service.shutdown()));
+}
+
+#[test]
+fn replace_view_document_paged_to_editable_collapses_and_readonly_rebinds_all() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("reload-multi.sqlite3");
+    let source = dir.path().join("source.txt");
+    fs::write(&source, "small clean text\n").unwrap();
+    let service = RecoveryHandle::start(&db).unwrap();
+    let mut layout = receive(service.request_manifest().unwrap()).layout;
+    let pane_a = layout.active_pane_id();
+
+    let doc1 = document_key(DocumentId::new());
+    let v1 = add_layout_view(
+        &mut layout,
+        doc1,
+        ViewState {
+            cursor_byte: 10,
+            scroll_byte: 5,
+        },
+        true,
+    );
+    let v2_id = ViewId::new();
+    let split_res = layout
+        .apply_pane_command(PaneCommand::SplitAndClone {
+            pane: pane_a,
+            direction: SplitDirection::Right,
+            source: v1,
+            clone_view_id: v2_id,
+            clone_view_state: ViewState {
+                cursor_byte: 50,
+                scroll_byte: 25,
+            },
+        })
+        .unwrap();
+    let pane_b = split_res.created_pane.unwrap();
+    let v2 = ViewTarget {
+        view_id: v2_id,
+        document: doc1,
+    };
+
+    let rev1 = persist_test_layout(
+        &service,
+        &layout,
+        vec![DocumentChange::Create(DocumentMetaRecord {
+            key: doc1,
+            meta: DocMeta {
+                title: "reloadable".into(),
+                path: Some(source.clone()),
+                paged: true,
+                ..DocMeta::default()
+            },
+        })],
+    );
+
+    // 1. Paged -> Image rebinds BOTH v1 and v2 without saved_identity.
+    let doc2 = document_key(DocumentId::new());
+    let mut after_img = layout.clone();
+    after_img.views.get_mut(&v1.view_id).unwrap().document = doc2;
+    after_img.views.get_mut(&v1.view_id).unwrap().view = ViewState {
+        cursor_byte: 100,
+        scroll_byte: 0,
+    };
+    after_img.views.get_mut(&v2.view_id).unwrap().document = doc2;
+    after_img.views.get_mut(&v2.view_id).unwrap().view = ViewState {
+        cursor_byte: 200,
+        scroll_byte: 0,
+    };
+    let fp = FileFingerprint::of_path(&source).unwrap();
+    let rev2 = receive(
+        service
+            .replace_view_document(ReloadReplacement {
+                sequence: LayoutSeq(2),
+                expected_revision: rev1,
+                target: v1,
+                tombstone_gen: LifecycleGen(2),
+                replacement: DocumentMetaRecord {
+                    key: doc2,
+                    meta: DocMeta {
+                        title: "reloadable.png".into(),
+                        path: Some(source.clone()),
+                        origin_fingerprint: Some(fp),
+                        image_preview: true,
+                        ..DocMeta::default()
+                    },
+                },
+                after: after_img.clone(),
+            })
+            .unwrap(),
+    )
+    .revision;
+    let m2 = receive(service.request_manifest().unwrap());
+    assert_eq!(m2.layout, after_img);
+    assert_eq!(m2.documents.len(), 1);
+    assert_eq!(m2.documents[0].key(), doc2);
+
+    // 2. Image -> Editable must collapse secondary view v2.
+    let doc3 = document_key(DocumentId::new());
+    let v1_doc2 = m2.layout.target(v1.view_id).unwrap();
+    let v2_doc2 = m2.layout.target(v2.view_id).unwrap();
+    let editable_meta = staged_disk_metadata(&source);
+
+    // Uncollapsed after-layout must be rejected atomically.
+    let mut uncollapsed = after_img.clone();
+    uncollapsed.views.get_mut(&v1.view_id).unwrap().document = doc3;
+    uncollapsed.views.get_mut(&v2.view_id).unwrap().document = doc3;
+    assert_eq!(
+        response(
+            service
+                .replace_view_document(ReloadReplacement {
+                    sequence: LayoutSeq(3),
+                    expected_revision: rev2,
+                    target: v1_doc2,
+                    tombstone_gen: LifecycleGen(2),
+                    replacement: DocumentMetaRecord {
+                        key: doc3,
+                        meta: editable_meta.clone(),
+                    },
+                    after: uncollapsed,
+                })
+                .unwrap()
+        )
+        .unwrap_err()
+        .kind,
+        ErrorKind::InvalidInput
+    );
+
+    // Properly collapsed after-layout succeeds.
+    let mut collapsed = after_img.clone();
+    collapsed.views.get_mut(&v1.view_id).unwrap().document = doc3;
+    collapsed.views.get_mut(&v1.view_id).unwrap().view = ViewState::default();
+    collapsed.remove_views(&[v2_doc2]).unwrap();
+    receive(
+        service
+            .replace_view_document(ReloadReplacement {
+                sequence: LayoutSeq(4),
+                expected_revision: rev2,
+                target: v1_doc2,
+                tombstone_gen: LifecycleGen(2),
+                replacement: DocumentMetaRecord {
+                    key: doc3,
+                    meta: editable_meta,
+                },
+                after: collapsed.clone(),
+            })
+            .unwrap(),
+    );
+    let m3 = receive(service.request_manifest().unwrap());
+    assert_eq!(m3.layout, collapsed);
+    assert_eq!(m3.layout.views.len(), 1);
+    assert!(m3.layout.pane(pane_b).unwrap().tabs.is_empty());
+    assert_eq!(m3.layout.pane(pane_b).unwrap().active_view, None);
+    receive(admit(|| service.shutdown()));
+}
+
+#[test]
+fn read_manifest_collapses_duplicate_editable_draft_views() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("dup-editable.sqlite3");
+    let service = RecoveryHandle::start(&db).unwrap();
+    let mut layout = receive(service.request_manifest().unwrap()).layout;
+    let pane_a = layout.active_pane_id();
+
+    let clean_edit = document_key(DocumentId::new());
+    let ckpt_edit = document_key(DocumentId::new());
+
+    let c1 = add_layout_view(&mut layout, clean_edit, ViewState::default(), true);
+    let k1 = add_layout_view(&mut layout, ckpt_edit, ViewState::default(), false);
+    let c2_id = ViewId::new();
+    let k2_id = ViewId::new();
+    layout
+        .insert_shared_view(
+            pane_a,
+            LayoutView {
+                id: c2_id,
+                document: clean_edit,
+                group_id: GroupId::UNGROUPED,
+                view: ViewState::default(),
+            },
+            None,
+            false,
+        )
+        .unwrap();
+    layout
+        .insert_shared_view(
+            pane_a,
+            LayoutView {
+                id: k2_id,
+                document: ckpt_edit,
+                group_id: GroupId::UNGROUPED,
+                view: ViewState::default(),
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+    let rev = persist_test_layout(
+        &service,
+        &layout,
+        vec![
+            DocumentChange::Create(DocumentMetaRecord {
+                key: clean_edit,
+                meta: DocMeta {
+                    title: "clean.txt".into(),
+                    ..DocMeta::default()
+                },
+            }),
+            DocumentChange::Create(DocumentMetaRecord {
+                key: ckpt_edit,
+                meta: DocMeta {
+                    title: "dirty.txt".into(),
+                    ..DocMeta::default()
+                },
+            }),
+        ],
+    );
+    admit(|| service.try_commit(snapshot(ckpt_edit.doc_id, 1, "checkpointed draft")));
+    receive(admit(|| service.flush()));
+
+    let manifest = receive(service.request_manifest().unwrap());
+    assert!(manifest.repaired_or_fallback);
+    assert_eq!(manifest.layout.views.len(), 2);
+    assert!(manifest.layout.view(c1.view_id).is_some());
+    assert!(manifest.layout.view(k1.view_id).is_some());
+    assert!(manifest.layout.view(c2_id).is_none());
+    assert!(manifest.layout.view(k2_id).is_none());
+    assert_eq!(manifest.documents.len(), 2);
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|w| w.doc_id == Some(clean_edit.doc_id))
+    );
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|w| w.doc_id == Some(ckpt_edit.doc_id))
+    );
+
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM preserved_layouts WHERE layout_id=?1",
+            [i64::try_from(rev.0).unwrap()],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    receive(admit(|| service.shutdown()));
 }

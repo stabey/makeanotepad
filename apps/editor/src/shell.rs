@@ -555,6 +555,19 @@ pub enum PaletteCommandTarget {
     SetEncoding(EncodingSpec),
     SetLanguageAuto,
     SetLanguage(&'static str),
+    SplitAndCloneActiveViewRight,
+    SplitAndCloneActiveViewDown,
+    CloneActiveReadOnlyView,
+    FormatJson,
+    MinifyJson,
+    ValidateJson,
+    FormatJsonc,
+    MinifyJsonc,
+    ValidateJsonc,
+    ImageZoomIn,
+    ImageZoomOut,
+    ImageZoomActualSize,
+    ImageZoomFit,
 }
 
 #[cfg(test)]

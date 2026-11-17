@@ -1,12 +1,17 @@
 use super::*;
+use crate::image_view::{
+    MAX_WORKSPACE_IMAGE_BYTES, decode_render_image_off_thread, plan_image_cache_eviction,
+    render_image_decoded_bytes,
+};
+use crate::paged_view::PagedViewportApplyOutcome;
 use editor_services::RecoveryEntryOrigin;
 use editor_services::{
     CloseAck, CloseBatch, CloseDisposition, CloseEntry, ClosedViewPage, DocumentChange,
-    DocumentMetaRecord, GroupCommand, GroupCommandResult, LayoutAck, LayoutPayload, LayoutRevision,
-    LayoutSeq, LayoutView, MAX_SESSION_VIEWS, MAX_SPLIT_RATIO_BPS, MIN_SPLIT_RATIO_BPS,
-    PaneCommand, PaneCommandResult, PaneId, RecoveryCatalogSummary, RecoveryCursor,
-    RecoveryEntryKey, RecoveryPage, RecoveryPageRequest, ReloadReplacement, Reply, SessionWrite,
-    SplitNodeId, save_document_copy,
+    DocumentMetaRecord, GroupCommand, GroupCommandResult, ImageOpenOutcome, LayoutAck,
+    LayoutPayload, LayoutRevision, LayoutSeq, LayoutView, MAX_PANES, MAX_SESSION_VIEWS,
+    MAX_SPLIT_RATIO_BPS, MIN_SPLIT_RATIO_BPS, PaneCommand, PaneCommandResult, PaneId,
+    ReadOnlyReason, RecoveryCatalogSummary, RecoveryCursor, RecoveryEntryKey, RecoveryPage,
+    RecoveryPageRequest, ReloadReplacement, Reply, SessionWrite, SplitNodeId, save_document_copy,
 };
 use gpui_kit::component::button::Button;
 use gpui_kit::component::h_flex;
@@ -214,6 +219,59 @@ impl EditorWorkspace {
             .get(&key.doc_id)
             .filter(|s| s.document_key() == key)
     }
+    pub(crate) fn paged_view(
+        &self,
+        view_id: ViewId,
+    ) -> Option<(&PagedSourceState, &PagedViewportState)> {
+        let TabSlot::Paged(src) = self.view_slot(view_id)? else {
+            return None;
+        };
+        let vp = self.paged_viewports.get(&view_id)?;
+        Some((src, vp))
+    }
+    pub(crate) fn image_view(
+        &self,
+        view_id: ViewId,
+    ) -> Option<(&ImageTabState, &ImageViewportState)> {
+        let TabSlot::Image(img) = self.view_slot(view_id)? else {
+            return None;
+        };
+        let vp = self.image_viewports.get(&view_id)?;
+        Some((img, vp))
+    }
+    pub(crate) fn prune_orphaned_viewports(&mut self) {
+        self.paged_viewports
+            .retain(|id, _| self.session.views.contains_key(id));
+        self.image_viewports
+            .retain(|id, _| self.session.views.contains_key(id));
+    }
+    pub(crate) fn release_document_gpu_resources(
+        &mut self,
+        doc_id: DocumentId,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        if let Some(TabSlot::Image(img)) = self.documents.get_mut(&doc_id) {
+            if let ImagePayloadState::Decoding { cancel, .. } = &img.state {
+                cancel.cancel();
+            }
+            let _ = img.release_image_from_gpui(window, cx);
+        }
+    }
+    pub(crate) fn release_all_image_gpu_resources(
+        &mut self,
+        mut window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        for slot in self.documents.values_mut() {
+            if let TabSlot::Image(img) = slot {
+                if let ImagePayloadState::Decoding { cancel, .. } = &img.state {
+                    cancel.cancel();
+                }
+                let _ = img.release_image_from_gpui(window.as_deref_mut(), cx);
+            }
+        }
+    }
     pub(crate) fn active_slot(&self) -> Option<&TabSlot> {
         self.view_slot(self.active_view_id()?)
     }
@@ -376,10 +434,17 @@ impl EditorWorkspace {
     pub(super) fn document_commit_admissible(&self, id: DocumentId) -> bool {
         self.persistence.allows_commit(id)
     }
-    fn capture_view(&mut self, id: ViewId, cx: &App) {
+    pub(crate) fn capture_view(&mut self, id: ViewId, cx: &App) {
         let view = match self.view_slot(id) {
             Some(TabSlot::Editable(ed)) => ed.capture_view_state(cx),
-            Some(TabSlot::Paged(pv)) => pv.capture_view_state(),
+            Some(TabSlot::Paged(_)) => match self.paged_viewports.get(&id) {
+                Some(vp) => vp.capture_view_state(),
+                None => return,
+            },
+            Some(TabSlot::Image(_)) => match self.image_viewports.get(&id) {
+                Some(vp) => vp.capture_view_state(),
+                None => return,
+            },
             _ => return,
         };
         if let Some(record) = self.session.views.get_mut(&id) {
@@ -774,7 +839,11 @@ impl EditorWorkspace {
         }
         match self.documents.get_mut(&target.document.doc_id) {
             Some(TabSlot::Editable(ed)) => ed.clear_search_highlights(cx),
-            Some(TabSlot::Paged(pv)) => pv.highlighted_byte_range = None,
+            Some(TabSlot::Paged(_)) => {
+                if let Some(vp) = self.paged_viewports.get_mut(&target.view_id) {
+                    vp.highlighted_byte_range = None;
+                }
+            }
             _ => {}
         }
     }
@@ -808,9 +877,15 @@ impl EditorWorkspace {
         let prefs = self.current_view_prefs();
         self.activation_clock = self.activation_clock.saturating_add(1);
         if let Some(target) = next {
-            if let Some(TabSlot::Editable(ed)) = self.documents.get_mut(&target.document.doc_id) {
-                ed.last_activated_tick = self.activation_clock;
-                ed.apply_view_prefs(prefs, window, cx);
+            match self.documents.get_mut(&target.document.doc_id) {
+                Some(TabSlot::Editable(ed)) => {
+                    ed.last_activated_tick = self.activation_clock;
+                    ed.apply_view_prefs(prefs, window, cx);
+                }
+                Some(TabSlot::Image(img)) => {
+                    img.last_activated_tick = self.activation_clock;
+                }
+                _ => {}
             }
         }
         self.focus_active(window, cx);
@@ -978,6 +1053,11 @@ impl EditorWorkspace {
                     matches!(
                         self.view_slot(target.view_id),
                         Some(TabSlot::Dehydrated(_) | TabSlot::Hydrating { .. })
+                    ) || matches!(
+                        self.view_slot(target.view_id),
+                        Some(TabSlot::Image(img))
+                            if matches!(img.state, ImagePayloadState::Dehydrated)
+                                && img.meta.path.is_some()
                     )
                 });
             if !self.hydration_requests.is_empty() {
@@ -990,6 +1070,28 @@ impl EditorWorkspace {
             ) {
                 break;
             }
+            if let Some(TabSlot::Image(img)) = self.view_slot(target.view_id)
+                && matches!(img.state, ImagePayloadState::Dehydrated)
+            {
+                let img_doc_id = img.doc_id;
+                let img_gen = img.lifecycle_gen;
+                let img_meta = img.meta.clone();
+                if let Some(path) = img_meta.path.clone()
+                    && let Ok(seq) = self.next_operation()
+                {
+                    let stub = SessionDocumentStub {
+                        doc_id: img_doc_id,
+                        lifecycle_gen: img_gen,
+                        durable_rev: Revision(0),
+                        meta: img_meta,
+                        has_checkpoint: false,
+                    };
+                    self.documents
+                        .insert(stub.doc_id, TabSlot::Hydrating { stub, req_seq: seq });
+                    self.spawn_disk_open(target, seq, path, false, false, window, cx);
+                }
+                break;
+            }
             self.retry_view_hydration(target, window, cx);
             if matches!(self.view_slot(target.view_id), Some(TabSlot::Dehydrated(_))) {
                 break;
@@ -998,12 +1100,12 @@ impl EditorWorkspace {
         let mut paged = [None; editor_services::MAX_PANES];
         let mut count = 0;
         for target in self.visible_targets() {
-            if let Some(TabSlot::Paged(pv)) = self.view_slot(target.view_id)
-                && pv.current_slice.is_none()
-                && !pv.is_loading
-                && pv.source_error.is_none()
+            if let Some((src, vp)) = self.paged_view(target.view_id)
+                && vp.current_slice.is_none()
+                && !vp.is_loading
+                && src.source_error.is_none()
             {
-                paged[count] = Some((target, pv.current_anchor_byte));
+                paged[count] = Some((target, vp.current_anchor_byte));
                 count += 1;
             }
         }
@@ -1596,37 +1698,55 @@ impl EditorWorkspace {
         .detach();
     }
     fn stage_meta(path: &Path, outcome: OpenOutcome, language: Option<String>) -> StagedDisk {
-        let (encoding, line_ending, fingerprint, saved_identity, readonly, paged) = match &outcome {
-            OpenOutcome::Editable {
-                encoding,
-                line_ending,
-                fingerprint,
-                identity,
-                readonly_reason,
-                ..
-            } => (
-                *encoding,
-                *line_ending,
-                fingerprint.clone(),
-                Some(*identity),
-                readonly_reason.clone(),
-                false,
-            ),
-            OpenOutcome::Paged {
-                encoding,
-                line_ending,
-                fingerprint,
-                readonly_reason,
-                ..
-            } => (
-                *encoding,
-                *line_ending,
-                fingerprint.clone(),
-                None,
-                Some(readonly_reason.clone()),
-                true,
-            ),
-        };
+        let (encoding, line_ending, fingerprint, saved_identity, readonly, paged, image_preview) =
+            match &outcome {
+                OpenOutcome::Editable {
+                    encoding,
+                    line_ending,
+                    fingerprint,
+                    identity,
+                    readonly_reason,
+                    ..
+                } => (
+                    *encoding,
+                    *line_ending,
+                    fingerprint.clone(),
+                    Some(*identity),
+                    readonly_reason.clone(),
+                    false,
+                    false,
+                ),
+                OpenOutcome::Paged {
+                    encoding,
+                    line_ending,
+                    fingerprint,
+                    readonly_reason,
+                    ..
+                } => (
+                    *encoding,
+                    *line_ending,
+                    fingerprint.clone(),
+                    None,
+                    Some(readonly_reason.clone()),
+                    true,
+                    false,
+                ),
+                OpenOutcome::Image(img) => {
+                    let fingerprint = match img {
+                        ImageOpenOutcome::Ready { fingerprint, .. }
+                        | ImageOpenOutcome::OverBudget { fingerprint, .. } => fingerprint.clone(),
+                    };
+                    (
+                        EncodingSpec::UnsupportedReadOnly,
+                        LineEnding::MixedReadOnly,
+                        fingerprint,
+                        None,
+                        Some(ReadOnlyReason::ImagePreview),
+                        false,
+                        true,
+                    )
+                }
+            };
         StagedDisk {
             outcome,
             meta: DocMeta {
@@ -1645,6 +1765,7 @@ impl EditorWorkspace {
                 language_override: language,
                 readonly_reason: readonly,
                 paged,
+                image_preview,
             },
         }
     }
@@ -1693,7 +1814,7 @@ impl EditorWorkspace {
                 source_gen,
                 readonly_reason,
                 ..
-            } => Ok(TabSlot::Paged(PagedTabState::new(
+            } => Ok(TabSlot::Paged(PagedSourceState::new(
                 key.doc_id,
                 key.lifecycle_gen,
                 staged.meta,
@@ -1701,9 +1822,224 @@ impl EditorWorkspace {
                 source_gen,
                 readonly_reason,
                 None,
-                view.scroll_byte,
             ))),
+            OpenOutcome::Image(img_outcome) => {
+                self.activation_clock = self.activation_clock.saturating_add(1);
+                let tick = self.activation_clock;
+                match img_outcome {
+                    ImageOpenOutcome::OverBudget { info, reason, .. } => {
+                        Ok(TabSlot::Image(ImageTabState {
+                            doc_id: key.doc_id,
+                            lifecycle_gen: key.lifecycle_gen,
+                            meta: staged.meta,
+                            format: info.format,
+                            width: info.width,
+                            height: info.height,
+                            frames: info.frames,
+                            file_bytes: info.file_bytes,
+                            estimated_decoded_bytes: info.estimated_decoded_bytes,
+                            last_activated_tick: tick,
+                            state: ImagePayloadState::OverBudget { reason },
+                        }))
+                    }
+                    ImageOpenOutcome::Ready { info, bytes, .. } => {
+                        let visible_docs: std::collections::HashSet<DocumentId> =
+                            self.visible_targets().map(|t| t.document.doc_id).collect();
+                        let slots: Vec<(DocumentId, u64, bool, u64)> = self
+                            .documents
+                            .values()
+                            .filter_map(|slot| match slot {
+                                TabSlot::Image(img)
+                                    if img.doc_id != key.doc_id
+                                        && img.ready_decoded_bytes() > 0 =>
+                                {
+                                    Some((
+                                        img.doc_id,
+                                        img.ready_decoded_bytes(),
+                                        visible_docs.contains(&img.doc_id),
+                                        img.last_activated_tick,
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let initial_state = match plan_image_cache_eviction(
+                            &slots,
+                            info.estimated_decoded_bytes,
+                            MAX_WORKSPACE_IMAGE_BYTES,
+                        ) {
+                            None => ImagePayloadState::OverBudget {
+                                reason: format!(
+                                    "Workspace image cache budget ({}) exceeded by active visible images",
+                                    format_bytes(MAX_WORKSPACE_IMAGE_BYTES)
+                                ),
+                            },
+                            Some(evict_ids) => {
+                                for evict_id in evict_ids {
+                                    self.release_document_gpu_resources(evict_id, Some(window), cx);
+                                }
+                                let req_seq = self.next_operation()?;
+                                let cancel = CancelToken::new();
+                                let img_tab = ImageTabState {
+                                    doc_id: key.doc_id,
+                                    lifecycle_gen: key.lifecycle_gen,
+                                    meta: staged.meta,
+                                    format: info.format,
+                                    width: info.width,
+                                    height: info.height,
+                                    frames: info.frames,
+                                    file_bytes: info.file_bytes,
+                                    estimated_decoded_bytes: info.estimated_decoded_bytes,
+                                    last_activated_tick: tick,
+                                    state: ImagePayloadState::Decoding {
+                                        req_seq,
+                                        cancel: cancel.clone(),
+                                    },
+                                };
+                                self.spawn_image_decode(
+                                    key,
+                                    req_seq,
+                                    img_tab.gpui_format(),
+                                    bytes,
+                                    cancel,
+                                    window,
+                                    cx,
+                                );
+                                return Ok(TabSlot::Image(img_tab));
+                            }
+                        };
+                        Ok(TabSlot::Image(ImageTabState {
+                            doc_id: key.doc_id,
+                            lifecycle_gen: key.lifecycle_gen,
+                            meta: staged.meta,
+                            format: info.format,
+                            width: info.width,
+                            height: info.height,
+                            frames: info.frames,
+                            file_bytes: info.file_bytes,
+                            estimated_decoded_bytes: info.estimated_decoded_bytes,
+                            last_activated_tick: tick,
+                            state: initial_state,
+                        }))
+                    }
+                }
+            }
         }
+    }
+    fn spawn_image_decode(
+        &self,
+        doc_key: DocumentKey,
+        req_seq: u64,
+        format: gpui_kit::ImageFormat,
+        bytes: Arc<[u8]>,
+        cancel: CancelToken,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let svg_renderer = cx.svg_renderer();
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    decode_render_image_off_thread(format, bytes, svg_renderer, &cancel)
+                })
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                this.complete_image_decode(doc_key, req_seq, result, Some(window), cx);
+            });
+        })
+        .detach();
+    }
+    fn complete_image_decode(
+        &mut self,
+        doc_key: DocumentKey,
+        req_seq: u64,
+        result: Result<Arc<gpui_kit::RenderImage>, String>,
+        mut window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let has_live_view = self.session.views.values().any(|v| v.document == doc_key);
+        let matches_decoding = !self.shutting_down
+            && has_live_view
+            && matches!(
+                self.documents.get(&doc_key.doc_id),
+                Some(TabSlot::Image(img))
+                    if img.lifecycle_gen == doc_key.lifecycle_gen
+                        && matches!(
+                            img.state,
+                            ImagePayloadState::Decoding {
+                                req_seq: active_seq,
+                                ref cancel,
+                            } if active_seq == req_seq && !cancel.is_cancelled()
+                        )
+            );
+        if !matches_decoding {
+            if let Ok(render_image) = result {
+                cx.drop_image(render_image, window);
+            }
+            return;
+        }
+        match result {
+            Ok(render_image) => {
+                let decoded_bytes = render_image_decoded_bytes(&render_image);
+                let visible_docs: std::collections::HashSet<DocumentId> =
+                    self.visible_targets().map(|t| t.document.doc_id).collect();
+                let slots: Vec<(DocumentId, u64, bool, u64)> = self
+                    .documents
+                    .values()
+                    .filter_map(|slot| match slot {
+                        TabSlot::Image(img)
+                            if img.doc_id != doc_key.doc_id && img.ready_decoded_bytes() > 0 =>
+                        {
+                            Some((
+                                img.doc_id,
+                                img.ready_decoded_bytes(),
+                                visible_docs.contains(&img.doc_id),
+                                img.last_activated_tick,
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                match plan_image_cache_eviction(&slots, decoded_bytes, MAX_WORKSPACE_IMAGE_BYTES) {
+                    None => {
+                        cx.drop_image(render_image, window);
+                        if let Some(TabSlot::Image(img)) = self.documents.get_mut(&doc_key.doc_id) {
+                            img.state = ImagePayloadState::OverBudget {
+                                reason: format!(
+                                    "Decoded image ({}) exceeds workspace cache budget ({})",
+                                    format_bytes(decoded_bytes),
+                                    format_bytes(MAX_WORKSPACE_IMAGE_BYTES)
+                                ),
+                            };
+                        }
+                    }
+                    Some(evict_ids) => {
+                        for evict_id in evict_ids {
+                            self.release_document_gpu_resources(
+                                evict_id,
+                                window.as_deref_mut(),
+                                cx,
+                            );
+                        }
+                        if let Some(TabSlot::Image(img)) = self.documents.get_mut(&doc_key.doc_id) {
+                            img.state = ImagePayloadState::Ready {
+                                render_image,
+                                decoded_bytes,
+                            };
+                        } else {
+                            cx.drop_image(render_image, window);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(TabSlot::Image(img)) = self.documents.get_mut(&doc_key.doc_id) {
+                    img.state = ImagePayloadState::Failed { error };
+                }
+            }
+        }
+        cx.notify();
     }
     fn complete_disk_open(
         &mut self,
@@ -1751,6 +2087,7 @@ impl EditorWorkspace {
                 })
             {
                 let _ = self.session.remove_views(&[target]);
+                self.prune_orphaned_viewports();
                 self.documents.remove(&target.document.doc_id);
                 self.persistence.metadata.remove(&target.document.doc_id);
                 self.persistence.structural = true;
@@ -1766,23 +2103,76 @@ impl EditorWorkspace {
         });
         match result {
             Ok(slot) => {
+                let doc_id = target.document.doc_id;
                 let metadata_changed = slot.meta() != &stub.meta;
-                self.documents.insert(target.document.doc_id, slot);
+                let is_editable = matches!(slot, TabSlot::Editable(_));
+                let is_paged = matches!(slot, TabSlot::Paged(_));
+                let is_image = matches!(slot, TabSlot::Image(_));
+                let total_bytes = if let TabSlot::Paged(src) = &slot {
+                    src.total_bytes()
+                } else {
+                    0
+                };
+                self.documents.insert(doc_id, slot);
                 if metadata_changed {
-                    self.mark_metadata(target.document.doc_id, PendingDocChangeKind::Update);
+                    self.mark_metadata(doc_id, PendingDocChangeKind::Update);
                 }
                 if mru {
                     self.record_recent_file(path, window, cx);
                 }
+                if is_paged {
+                    for vt in self.session.views_for_doc(doc_id) {
+                        let view_state = &self.session.views[&vt.view_id].view;
+                        self.paged_viewports.entry(vt.view_id).or_insert_with(|| {
+                            PagedViewportState::new(view_state.scroll_byte, total_bytes)
+                        });
+                    }
+                } else if is_image {
+                    for vt in self.session.views_for_doc(doc_id) {
+                        let view_state = &self.session.views[&vt.view_id].view;
+                        self.image_viewports
+                            .entry(vt.view_id)
+                            .or_insert_with(|| ImageViewportState::new_from_view(view_state));
+                    }
+                } else if is_editable && self.session.doc_view_count(doc_id) > 1 {
+                    let secondary: Vec<ViewTarget> = self
+                        .session
+                        .views_for_doc(doc_id)
+                        .into_iter()
+                        .filter(|vt| vt.view_id != target.view_id)
+                        .collect();
+                    if !secondary.is_empty() {
+                        let _ = self.session.remove_views(&secondary);
+                        self.prune_orphaned_viewports();
+                        self.persistence.structural = true;
+                        self.layout_dirty = true;
+                        window.push_notification(
+                            Notification::warning(
+                                "File now opens as editable; closed extra read-only split views per ADR 009.",
+                            ),
+                            cx,
+                        );
+                    }
+                }
                 self.ensure_paged_indexer_running(cx);
-                if let Some(TabSlot::Paged(pv)) = self.view_slot(target.view_id) {
-                    let offset = pv.current_anchor_byte;
-                    self.request_paged_viewport(
-                        target,
-                        ViewportAnchor::ByteOffset(offset),
-                        window,
-                        cx,
-                    );
+                if is_paged {
+                    let visible_paged: Vec<(ViewTarget, u64)> = self
+                        .visible_targets()
+                        .filter(|t| t.document.doc_id == doc_id)
+                        .filter_map(|t| {
+                            self.paged_viewports
+                                .get(&t.view_id)
+                                .map(|vp| (t, vp.current_anchor_byte))
+                        })
+                        .collect();
+                    for (vt, offset) in visible_paged {
+                        self.request_paged_viewport(
+                            vt,
+                            ViewportAnchor::ByteOffset(offset),
+                            window,
+                            cx,
+                        );
+                    }
                 }
             }
             Err(e) if e.kind == ErrorKind::Busy => {
@@ -1839,11 +2229,17 @@ impl EditorWorkspace {
         if self.session.resolve(target).is_err() || self.is_lifecycle_busy() {
             return;
         }
-        let Some(TabSlot::Paged(pv)) = self.documents.get_mut(&target.document.doc_id) else {
+        let Some(TabSlot::Paged(src)) = self.documents.get(&target.document.doc_id) else {
             return;
         };
-        let handle = pv.handle.clone();
-        let (seq, req, cancel) = pv.prepare_viewport_request(anchor);
+        let handle = src.handle.clone();
+        let source_gen = src.source_gen;
+        let total_bytes = src.total_bytes();
+        let vp = self
+            .paged_viewports
+            .entry(target.view_id)
+            .or_insert_with(|| PagedViewportState::new(0, total_bytes));
+        let (seq, req, cancel) = vp.prepare_viewport_request(source_gen, anchor);
         cx.spawn_in(window, async move |weak, cx| {
             let result = cx
                 .background_executor()
@@ -1883,9 +2279,26 @@ impl EditorWorkspace {
                 });
             return;
         }
-        if let Some(TabSlot::Paged(pv)) = self.documents.get_mut(&target.document.doc_id) {
-            if pv.apply_viewport_result(seq, result) && pv.source_error.is_some() {
-                self.search.clear_results();
+        if let Some(TabSlot::Paged(src)) = self.documents.get_mut(&target.document.doc_id)
+            && let Some(vp) = self.paged_viewports.get_mut(&target.view_id)
+        {
+            match vp.apply_viewport_result(seq, src.source_gen, result) {
+                PagedViewportApplyOutcome::Ignored => {}
+                PagedViewportApplyOutcome::Applied(status) => {
+                    src.index_status = status;
+                }
+                PagedViewportApplyOutcome::SourceChanged(msg) => {
+                    src.source_error = Some(msg);
+                    if self.search.target_doc_id == Some(target.document.doc_id) {
+                        self.search.cancel_active();
+                        self.search.clear_results();
+                    }
+                }
+                PagedViewportApplyOutcome::Failed(_) => {
+                    if self.search.target_view == Some(target) {
+                        self.search.clear_results();
+                    }
+                }
             }
         }
         cx.notify();
@@ -1969,7 +2382,10 @@ impl EditorWorkspace {
         let early = if untouched
             && (!manifest.layout.views.is_empty() || manifest.layout.panes().count() > 1)
         {
+            self.release_all_image_gpu_resources(Some(window), cx);
             self.documents.clear();
+            self.paged_viewports.clear();
+            self.image_viewports.clear();
             self.persistence.metadata.clear();
             SessionLayout::default()
         } else {
@@ -2005,6 +2421,7 @@ impl EditorWorkspace {
             layout.pane_mut(recovered_pane).unwrap().active_view = early_active;
         }
         self.session = layout;
+        self.prune_orphaned_viewports();
         let needs_write = !early.views.is_empty() || deferred > 0 || manifest.repaired_or_fallback;
         self.persistence.structural = needs_write;
         self.layout_dirty = needs_write;
@@ -2078,6 +2495,20 @@ impl EditorWorkspace {
         }
         let ed = match self.resolve_slot(target) {
             Ok(TabSlot::Editable(ed)) => ed,
+            Ok(TabSlot::Image(_)) => {
+                self.notify_error(
+                    failure(
+                        ErrorKind::InvalidInput,
+                        "Image preview is read-only and cannot be saved",
+                    ),
+                    window,
+                    cx,
+                );
+                if let Some(seq) = owner {
+                    self.cancel_lifecycle(seq, window, cx);
+                }
+                return;
+            }
             Ok(_) => {
                 self.notify_error(
                     failure(
@@ -2249,6 +2680,20 @@ impl EditorWorkspace {
             );
             return;
         }
+        if matches!(slot, TabSlot::Image(_)) {
+            self.notify_error(
+                failure(
+                    ErrorKind::InvalidInput,
+                    "Image preview is read-only; copy the source file on disk instead",
+                ),
+                window,
+                cx,
+            );
+            if let Some(seq) = owner {
+                self.cancel_lifecycle(seq, window, cx);
+            }
+            return;
+        }
         let dir = slot
             .meta()
             .path
@@ -2353,7 +2798,7 @@ impl EditorWorkspace {
                 | TabSlot::Failed { stub: s, .. } => {
                     (s.has_checkpoint.then_some(s.durable_rev), None, false)
                 }
-                TabSlot::Paged(_) => (None, None, false),
+                TabSlot::Paged(_) | TabSlot::Image(_) => (None, None, false),
             };
             frozen.push(FrozenView {
                 target,
@@ -2431,13 +2876,346 @@ impl EditorWorkspace {
         }
         self.request_close_targets(targets, window, cx);
     }
+    pub(crate) fn split_and_clone_active_view(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_id) = self.active_view_id() else {
+            return;
+        };
+        let Some(target) = self.view_target(active_id) else {
+            return;
+        };
+        self.split_and_clone_view(self.active_pane_id(), target, direction, window, cx);
+    }
+
+    pub(crate) fn split_and_clone_view(
+        &mut self,
+        pane: PaneId,
+        source: ViewTarget,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mutation_allowed() {
+            return;
+        }
+        let slot_kind = match self.resolve_slot(source) {
+            Ok(TabSlot::Paged(src)) => Ok(src.total_bytes()),
+            Ok(TabSlot::Image(_)) => Err(()),
+            Ok(TabSlot::Editable(_)) => {
+                window.push_notification(
+                    Notification::warning(
+                        "Multi-view split cloning is supported only for Paged large files and Image previews; Editable multi-view remains disabled per ADR 009.",
+                    ),
+                    cx,
+                );
+                return;
+            }
+            Ok(_) => {
+                window.push_notification(
+                    Notification::info("Split cloning requires a loaded Paged or Image view."),
+                    cx,
+                );
+                return;
+            }
+            Err(err) => {
+                self.notify_error(err, window, cx);
+                return;
+            }
+        };
+        if self.session.views.len() >= MAX_SESSION_VIEWS {
+            window.push_notification(
+                Notification::warning(format!(
+                    "Maximum of {MAX_SESSION_VIEWS} open views reached."
+                )),
+                cx,
+            );
+            return;
+        }
+        if self.session.panes().count() >= MAX_PANES {
+            let msg = format!("Maximum of {MAX_PANES} split panes reached.");
+            self.status_flash = Some((msg.clone(), Instant::now()));
+            window.push_notification(Notification::warning(msg), cx);
+            cx.notify();
+            return;
+        }
+        let root_bounds = self.group_ui.panes.root_bounds();
+        if let Err(reason) = crate::group_ui::pane_ui::can_split_pane_in_bounds(
+            &self.session.tree.root,
+            root_bounds,
+            pane,
+            direction,
+            &|id, fallback| self.pane_split_ratio(id).unwrap_or(fallback),
+        ) {
+            self.status_flash = Some((reason.to_string(), Instant::now()));
+            window.push_notification(Notification::warning(reason), cx);
+            cx.notify();
+            return;
+        }
+        self.capture_view(source.view_id, cx);
+        let clone_view_state = match slot_kind {
+            Ok(_) => self
+                .paged_viewports
+                .get(&source.view_id)
+                .map(PagedViewportState::capture_view_state)
+                .unwrap_or_default(),
+            Err(()) => self
+                .image_viewports
+                .get(&source.view_id)
+                .map(ImageViewportState::capture_view_state)
+                .unwrap_or_default(),
+        };
+        let clone_view_id = ViewId::new();
+        match self.apply_pane_command(
+            PaneCommand::SplitAndClone {
+                pane,
+                direction,
+                source,
+                clone_view_id,
+                clone_view_state: clone_view_state.clone(),
+            },
+            window,
+            cx,
+        ) {
+            Ok(_) => {
+                if self.is_focus_only() {
+                    self.set_focus_only(false, window, cx);
+                }
+                match slot_kind {
+                    Ok(total_bytes) => {
+                        self.paged_viewports.insert(
+                            clone_view_id,
+                            PagedViewportState::new(clone_view_state.scroll_byte, total_bytes),
+                        );
+                        let clone_target = ViewTarget {
+                            view_id: clone_view_id,
+                            document: source.document,
+                        };
+                        self.request_paged_viewport(
+                            clone_target,
+                            ViewportAnchor::ByteOffset(clone_view_state.scroll_byte),
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(()) => {
+                        self.image_viewports.insert(
+                            clone_view_id,
+                            ImageViewportState::new_from_view(&clone_view_state),
+                        );
+                        cx.notify();
+                    }
+                }
+            }
+            Err(err) => {
+                self.notify_error(err, window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn clone_active_readonly_view_in_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_id) = self.active_view_id() else {
+            return;
+        };
+        let Some(target) = self.view_target(active_id) else {
+            return;
+        };
+        self.clone_readonly_view_in_pane(self.active_pane_id(), target, window, cx);
+    }
+
+    pub(crate) fn clone_readonly_view_in_pane(
+        &mut self,
+        pane: PaneId,
+        source: ViewTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mutation_allowed() {
+            return;
+        }
+        if self.recovery.is_none() || self.persistence.revision.is_none() || self.persistence.failed
+        {
+            self.notify_error(
+                failure(
+                    ErrorKind::Storage,
+                    "Pane changes require available session persistence",
+                ),
+                window,
+                cx,
+            );
+            return;
+        }
+        let slot_kind = match self.resolve_slot(source) {
+            Ok(TabSlot::Paged(src)) => Ok(src.total_bytes()),
+            Ok(TabSlot::Image(_)) => Err(()),
+            Ok(TabSlot::Editable(_)) => {
+                window.push_notification(
+                    Notification::warning(
+                        "Multi-view cloning is supported only for Paged large files and Image previews; Editable multi-view remains disabled per ADR 009.",
+                    ),
+                    cx,
+                );
+                return;
+            }
+            Ok(_) => {
+                window.push_notification(
+                    Notification::info("Duplicating view requires a loaded Paged or Image view."),
+                    cx,
+                );
+                return;
+            }
+            Err(err) => {
+                self.notify_error(err, window, cx);
+                return;
+            }
+        };
+        if self.session.views.len() >= MAX_SESSION_VIEWS {
+            window.push_notification(
+                Notification::warning(format!(
+                    "Maximum of {MAX_SESSION_VIEWS} open views reached."
+                )),
+                cx,
+            );
+            return;
+        }
+        self.capture_view(source.view_id, cx);
+        let clone_view_state = match slot_kind {
+            Ok(_) => self
+                .paged_viewports
+                .get(&source.view_id)
+                .map(PagedViewportState::capture_view_state)
+                .unwrap_or_default(),
+            Err(()) => self
+                .image_viewports
+                .get(&source.view_id)
+                .map(ImageViewportState::capture_view_state)
+                .unwrap_or_default(),
+        };
+        let group_id = self
+            .session
+            .views
+            .get(&source.view_id)
+            .map(|v| v.group_id)
+            .unwrap_or(GroupId::UNGROUPED);
+        let old = self.active_view_id().and_then(|id| self.view_target(id));
+        let clone_view_id = ViewId::new();
+        if let Err(err) = self.session.insert_shared_view(
+            pane,
+            LayoutView {
+                id: clone_view_id,
+                document: source.document,
+                group_id,
+                view: clone_view_state.clone(),
+            },
+            None,
+            true,
+        ) {
+            self.notify_error(err, window, cx);
+            return;
+        }
+        self.persistence.structural = true;
+        self.layout_dirty = true;
+        match slot_kind {
+            Ok(total_bytes) => {
+                self.paged_viewports.insert(
+                    clone_view_id,
+                    PagedViewportState::new(clone_view_state.scroll_byte, total_bytes),
+                );
+                self.finish_target_switch(old, window, cx);
+                self.request_paged_viewport(
+                    ViewTarget {
+                        view_id: clone_view_id,
+                        document: source.document,
+                    },
+                    ViewportAnchor::ByteOffset(clone_view_state.scroll_byte),
+                    window,
+                    cx,
+                );
+            }
+            Err(()) => {
+                self.image_viewports.insert(
+                    clone_view_id,
+                    ImageViewportState::new_from_view(&clone_view_state),
+                );
+                self.finish_target_switch(old, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn request_close_targets(
         &mut self,
         targets: Vec<ViewTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let seq = match self.freeze_lifecycle(targets, LifecycleKind::Close, cx) {
+        let mut seen_views = std::collections::HashSet::new();
+        let mut unique_targets = Vec::with_capacity(targets.len());
+        let mut counts_by_doc: HashMap<DocumentId, usize> = HashMap::new();
+        for target in targets {
+            if seen_views.insert(target.view_id) {
+                *counts_by_doc.entry(target.document.doc_id).or_default() += 1;
+                unique_targets.push(target);
+            }
+        }
+        let all_leave_remaining = !unique_targets.is_empty()
+            && counts_by_doc
+                .iter()
+                .all(|(doc_id, count)| self.session.doc_view_count(*doc_id) > *count);
+        if all_leave_remaining {
+            if !self.mutation_allowed() {
+                return;
+            }
+            if self.recovery.is_none()
+                || self.persistence.revision.is_none()
+                || self.persistence.failed
+            {
+                self.notify_error(
+                    failure(
+                        ErrorKind::Storage,
+                        "Available acknowledged recovery storage is required",
+                    ),
+                    window,
+                    cx,
+                );
+                return;
+            }
+            for target in &unique_targets {
+                if let Err(err) = self.resolve_slot(*target) {
+                    self.notify_error(err, window, cx);
+                    return;
+                }
+            }
+            let old = self.active_view_id().and_then(|id| self.view_target(id));
+            if let Err(err) = self.session.remove_views(&unique_targets) {
+                self.notify_error(err, window, cx);
+                return;
+            }
+            self.prune_orphaned_viewports();
+            if let Some(search_target) = self.search.target_view
+                && unique_targets
+                    .iter()
+                    .any(|t| t.view_id == search_target.view_id)
+            {
+                self.search.cancel_active();
+                self.search.clear_results();
+                self.search.target_view = None;
+                self.rebuild_search_item_sizes();
+            }
+            self.persistence.structural = true;
+            self.layout_dirty = true;
+            self.finish_target_switch(old, window, cx);
+            cx.notify();
+            return;
+        }
+        let seq = match self.freeze_lifecycle(unique_targets, LifecycleKind::Close, cx) {
             Ok(seq) => seq,
             Err(e) => {
                 self.notify_error(e, window, cx);
@@ -3133,7 +3911,11 @@ impl EditorWorkspace {
                     let mut replacement = None;
                     if let Some(closed) = closed {
                         for f in &p.frozen {
-                            self.documents.remove(&f.target.document.doc_id);
+                            let doc_id = f.target.document.doc_id;
+                            if !after.views.values().any(|v| v.document.doc_id == doc_id) {
+                                self.release_document_gpu_resources(doc_id, Some(window), cx);
+                                self.documents.remove(&doc_id);
+                            }
                         }
                         if let LifecyclePhase::Closing {
                             scratch: Some(stub),
@@ -3157,6 +3939,11 @@ impl EditorWorkspace {
                     } = p.kind
                     {
                         let old = p.frozen[0].target.document.doc_id;
+                        self.release_document_gpu_resources(old, Some(window), cx);
+                        for vt in self.session.views_for_doc(old) {
+                            self.paged_viewports.remove(&vt.view_id);
+                            self.image_viewports.remove(&vt.view_id);
+                        }
                         self.documents.remove(&old);
                         self.recently_closed.retain(|c| c.document.doc_id != old);
                         let view = after.views[&p.frozen[0].target.view_id].view.clone();
@@ -3192,6 +3979,7 @@ impl EditorWorkspace {
                         ));
                     }
                     self.session = after;
+                    self.prune_orphaned_viewports();
                     self.persistence.revision = Some(ack.revision);
                     self.persistence
                         .metadata
@@ -3200,18 +3988,46 @@ impl EditorWorkspace {
                     self.layout_dirty = !self.persistence.metadata.is_empty();
                     self.restore_readonly(p.original_readonly, cx);
                     if let Some((target, record_mru)) = replacement {
+                        let doc_id = target.document.doc_id;
+                        if let Some(TabSlot::Paged(src)) = self.documents.get(&doc_id) {
+                            let total_bytes = src.total_bytes();
+                            for vt in self.session.views_for_doc(doc_id) {
+                                let view_state = &self.session.views[&vt.view_id].view;
+                                self.paged_viewports.entry(vt.view_id).or_insert_with(|| {
+                                    PagedViewportState::new(view_state.scroll_byte, total_bytes)
+                                });
+                            }
+                        } else if matches!(self.documents.get(&doc_id), Some(TabSlot::Image(_))) {
+                            for vt in self.session.views_for_doc(doc_id) {
+                                let view_state = &self.session.views[&vt.view_id].view;
+                                self.image_viewports.entry(vt.view_id).or_insert_with(|| {
+                                    ImageViewportState::new_from_view(view_state)
+                                });
+                            }
+                        }
                         if record_mru
                             && let Some(slot) = self.view_slot(target.view_id)
-                            && matches!(slot, TabSlot::Editable(_) | TabSlot::Paged(_))
+                            && matches!(
+                                slot,
+                                TabSlot::Editable(_) | TabSlot::Paged(_) | TabSlot::Image(_)
+                            )
                             && let Some(path) = slot.meta().path.clone()
                         {
                             self.record_recent_file(path, window, cx);
                         }
                         self.ensure_paged_indexer_running(cx);
-                        if let Some(TabSlot::Paged(paged)) = self.view_slot(target.view_id) {
-                            let offset = paged.current_anchor_byte;
+                        let visible_paged: Vec<(ViewTarget, u64)> = self
+                            .visible_targets()
+                            .filter(|t| t.document.doc_id == doc_id)
+                            .filter_map(|t| {
+                                self.paged_viewports
+                                    .get(&t.view_id)
+                                    .map(|vp| (t, vp.current_anchor_byte))
+                            })
+                            .collect();
+                        for (vt, offset) in visible_paged {
                             self.request_paged_viewport(
-                                target,
+                                vt,
                                 ViewportAnchor::ByteOffset(offset),
                                 window,
                                 cx,
@@ -3346,7 +4162,42 @@ impl EditorWorkspace {
                     .ok_or_else(|| failure(ErrorKind::InvalidInput, "Disk result not staged"))?;
                 let target = p.frozen[0].target;
                 let mut after = self.session.clone();
-                after.views.get_mut(&target.view_id).unwrap().document = *fresh;
+                let was_paged = matches!(
+                    self.documents.get(&target.document.doc_id),
+                    Some(TabSlot::Paged(_))
+                );
+                let was_image = matches!(
+                    self.documents.get(&target.document.doc_id),
+                    Some(TabSlot::Image(_))
+                );
+                let is_readonly_multi = staged.meta.paged || staged.meta.image_preview;
+                let preserve_view_state =
+                    (staged.meta.paged && was_paged) || (staged.meta.image_preview && was_image);
+                if is_readonly_multi {
+                    for v in after.views.values_mut() {
+                        if v.document.doc_id == target.document.doc_id {
+                            v.document = *fresh;
+                            if !preserve_view_state {
+                                v.view = ViewState::default();
+                            }
+                        }
+                    }
+                } else {
+                    let secondary: Vec<ViewTarget> = after
+                        .views_for_doc(target.document.doc_id)
+                        .into_iter()
+                        .filter(|vt| vt.view_id != target.view_id)
+                        .collect();
+                    if !secondary.is_empty() {
+                        after.remove_views(&secondary)?;
+                    }
+                    if let Some(v) = after.views.get_mut(&target.view_id) {
+                        v.document = *fresh;
+                        if was_paged || was_image {
+                            v.view = ViewState::default();
+                        }
+                    }
+                }
                 let tombstone_gen = LifecycleGen(
                     target
                         .document
@@ -3672,7 +4523,7 @@ impl EditorWorkspace {
                     if cancel.is_cancelled(){return Err(failure(ErrorKind::Cancelled,"Export cancelled before publication"));}
                     let entry=read_catalog_entry(recovery.as_ref(),&database,key)?;let stub=entry.stub?;
                     let rope=if stub.has_checkpoint{hydrate_from_source(recovery.as_ref(),&database,stub.key(),&cancel)?.rope}
-                        else if let Some(source)=&stub.meta.path{match open_document(stub.doc_id,source,&paging,OpenOptions::default(),&cancel)?{OpenOutcome::Editable{rope,..}=>rope,OpenOutcome::Paged{..}=>return Err(failure(ErrorKind::Unsupported,"This disk-backed record exceeds the 64 MiB draft export hydration cap; copy the original disk file instead"))}}
+                        else if let Some(source)=&stub.meta.path{match open_document(stub.doc_id,source,&paging,OpenOptions::default(),&cancel)?{OpenOutcome::Editable{rope,..}=>rope,OpenOutcome::Paged{..}=>return Err(failure(ErrorKind::Unsupported,"This disk-backed record exceeds the 64 MiB draft export hydration cap; copy the original disk file instead")),OpenOutcome::Image(_)=>return Err(failure(ErrorKind::Unsupported,"Image previews do not store editable drafts; copy the original image file instead"))}}
                         else{Rope::new()};
                     if cancel.is_cancelled(){return Err(failure(ErrorKind::Cancelled,"Export cancelled before publication"));}
                     let request=SaveRequest{doc_id:stub.doc_id,lifecycle_gen:stub.lifecycle_gen,captured_rev:stub.durable_rev,rope,target_path:path,encoding:stub.meta.encoding,line_ending:stub.meta.line_ending,expected_fingerprint:None,force_overwrite:true};
@@ -4045,6 +4896,8 @@ fn open_disk_for_budget(
 
 impl Drop for EditorWorkspace {
     fn drop(&mut self) {
+        self.paged_viewports.clear();
+        self.image_viewports.clear();
         for (_, cancel) in self.hydration_requests.values() {
             cancel.cancel();
         }

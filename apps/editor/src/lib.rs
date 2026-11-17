@@ -7,6 +7,8 @@ pub mod budget;
 pub mod cli;
 pub mod editor_adapter;
 mod group_ui;
+pub mod image_view;
+pub mod json_tools;
 pub mod language;
 pub mod line_ops;
 pub mod paged_view;

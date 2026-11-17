@@ -51,6 +51,8 @@ pub(super) async fn run_split_scenario(
         })?;
         verify_protected_pane_close(window, workspace, cx).await?;
         report.split_native_ui_verified = true;
+        verify_multiview_paged_native(window, workspace, cx).await?;
+        report.multiview_paged_shared_source_verified = true;
     }
     let (recovery, expected) = window
         .update(cx, |_, _, cx| {
@@ -433,5 +435,697 @@ async fn measure_fixture_input(
     report.typing_submit_p95_ms = Some(percentile_sorted(&samples, 0.95));
     report.typing_submit_max_ms = samples.last().copied();
     report.split_fixture_input_verified = true;
+    Ok(())
+}
+
+struct ScopedTempDir(PathBuf);
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn verify_multiview_paged_native(
+    window: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let raw_dir = cx.update(|cx| {
+        workspace
+            .read(cx)
+            .cli
+            .data_dir
+            .join(format!("splits_multiview_{:032x}", DocumentId::new().0))
+    });
+    std::fs::create_dir_all(&raw_dir).map_err(|e| format!("create splits_multiview dir: {e}"))?;
+    let dir = ScopedTempDir(std::fs::canonicalize(&raw_dir).unwrap_or(raw_dir));
+    let paged_path = dir.0.join("multiview_paged.txt");
+    {
+        use std::io::Write as _;
+        let file =
+            std::fs::File::create(&paged_path).map_err(|e| format!("create paged file: {e}"))?;
+        let mut writer = std::io::BufWriter::new(file);
+        for i in 0..6_000usize {
+            writeln!(writer, "line_{i:06}_0123456789abcdef_0123456789abcdef")
+                .map_err(|e| format!("write paged file: {e}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("flush paged file: {e}"))?;
+    }
+
+    let result = verify_multiview_paged_inner(window, workspace, &paged_path, cx).await;
+    let _ = cx.update(|cx| {
+        workspace.update(cx, |ws, _| {
+            ws.cli.editable_byte_limit = None;
+        });
+    });
+    result?;
+    drop(dir);
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        if ws.cli.editable_byte_limit.is_some() {
+            return Err(
+                "expected ws.cli.editable_byte_limit to be None after temporary paged cleanup"
+                    .into(),
+            );
+        }
+        Ok(())
+    })?;
+
+    verify_persisted_multiview_paged_setup(window, workspace, cx).await
+}
+
+async fn verify_persisted_multiview_paged_setup(
+    window: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let raw_data_dir = cx.update(|cx| workspace.read(cx).cli.data_dir.clone());
+    std::fs::create_dir_all(&raw_data_dir)
+        .map_err(|e| format!("create data_dir for persisted multiview paged: {e}"))?;
+    let data_dir = std::fs::canonicalize(&raw_data_dir).unwrap_or(raw_data_dir);
+    let raw_persisted_path = data_dir.join("persisted_multiview_paged.txt");
+    {
+        use std::io::Write as _;
+        let file = std::fs::File::create(&raw_persisted_path)
+            .map_err(|e| format!("create persisted paged file: {e}"))?;
+        let mut writer = std::io::BufWriter::new(file);
+        let long_line = vec![b'x'; 1_100_000];
+        writer
+            .write_all(&long_line)
+            .map_err(|e| format!("write long line in persisted paged file: {e}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|e| format!("write newline after long line in persisted paged file: {e}"))?;
+        for i in 0..200usize {
+            writeln!(writer, "line_{i:04}_persisted")
+                .map_err(|e| format!("write short line {i} in persisted paged file: {e}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("flush persisted paged file: {e}"))?;
+    }
+    let persisted_path = std::fs::canonicalize(&raw_persisted_path).unwrap_or(raw_persisted_path);
+
+    window
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.open_path(persisted_path.clone(), window, cx);
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && ws.active_view_id().is_some_and(|id| {
+                        ws.paged_view(id).is_some_and(|(src, vp)| {
+                            src.meta.path.as_deref() == Some(persisted_path.as_path())
+                                && vp.current_slice.is_some()
+                                && !vp.is_loading
+                        })
+                    })
+            })
+        },
+        "persisted multiview Paged initial viewport load",
+    )
+    .await?;
+
+    let target_a = cx.update(|cx| -> Result<ViewTarget, String> {
+        let ws = workspace.read(cx);
+        let view_a = ws
+            .active_view_id()
+            .ok_or("missing active view_a for persisted multiview paged")?;
+        let target_a = ws
+            .view_target(view_a)
+            .ok_or("missing ViewTarget for persisted multiview view_a")?;
+        let (_, vp) = ws
+            .paged_view(view_a)
+            .ok_or("persisted multiview view_a missing paged_view")?;
+        if vp.visible_byte_range().start != 0 {
+            return Err(format!(
+                "expected initial persisted paged offset 0, got {}",
+                vp.visible_byte_range().start
+            ));
+        }
+        if ws.session_layout().doc_view_count(target_a.document.doc_id) != 1 {
+            return Err("expected doc_view_count == 1 after persisted paged open".into());
+        }
+        let sources = ws.paging_service.stats().sources;
+        if sources != 1 {
+            return Err(format!(
+                "expected 1 paging source after persisted paged open, got {sources}"
+            ));
+        }
+        Ok(target_a)
+    })?;
+    let doc_id = target_a.document.doc_id;
+
+    focus_active_editor_or_workspace(window, workspace, cx)?;
+    let (can_right, can_down) = cx.update(|cx| {
+        let ws = workspace.read(cx);
+        let root = &ws.session_layout().tree.root;
+        let bounds = ws.group_ui.panes.root_bounds();
+        let pane = ws.active_pane_id();
+        let ratio = |id, fb| ws.pane_split_ratio(id).unwrap_or(fb);
+        (
+            crate::group_ui::pane_ui::can_split_pane_in_bounds(
+                root,
+                bounds,
+                pane,
+                editor_services::SplitDirection::Right,
+                &ratio,
+            )
+            .is_ok(),
+            crate::group_ui::pane_ui::can_split_pane_in_bounds(
+                root,
+                bounds,
+                pane,
+                editor_services::SplitDirection::Down,
+                &ratio,
+            )
+            .is_ok(),
+        )
+    });
+    if can_right {
+        dispatch_window_action(window, cx, SplitAndCloneActiveViewRight)?;
+    } else if can_down {
+        dispatch_window_action(window, cx, crate::actions::SplitAndCloneActiveViewDown)?;
+    } else {
+        dispatch_window_action(window, cx, crate::actions::CloneActiveReadOnlyView)?;
+    }
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                let views = ws.session_layout().views_for_doc(doc_id);
+                views.len() == 2
+                    && views.iter().all(|vt| {
+                        ws.paged_view(vt.view_id)
+                            .is_some_and(|(_, vp)| vp.current_slice.is_some() && !vp.is_loading)
+                    })
+            })
+        },
+        "persisted multiview Paged split/clone secondary viewport hydration",
+    )
+    .await?;
+
+    let target_b = cx.update(|cx| -> Result<ViewTarget, String> {
+        let ws = workspace.read(cx);
+        if ws.session_layout().doc_view_count(doc_id) != 2 {
+            return Err(format!(
+                "expected doc_view_count == 2 after persisted paged split/clone, got {}",
+                ws.session_layout().doc_view_count(doc_id)
+            ));
+        }
+        let target_b = ws
+            .session_layout()
+            .views_for_doc(doc_id)
+            .into_iter()
+            .find(|vt| vt.view_id != target_a.view_id)
+            .ok_or("persisted paged split/clone did not create a distinct ViewId")?;
+        if target_b.document != target_a.document {
+            return Err("persisted paged split/clone did not share DocumentKey".into());
+        }
+        let sources = ws.paging_service.stats().sources;
+        if sources != 1 {
+            return Err(format!(
+                "persisted paged split/clone allocated an extra PagedDocHandle: sources={sources}"
+            ));
+        }
+        Ok(target_b)
+    })?;
+    pump_frame(window, cx)?;
+
+    window
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.request_paged_viewport(
+                    target_b,
+                    ViewportAnchor::ByteOffset(524_288),
+                    window,
+                    cx,
+                );
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                ws.paged_view(target_b.view_id).is_some_and(|(_, vp)| {
+                    vp.current_slice.is_some()
+                        && !vp.is_loading
+                        && vp.visible_byte_range().start >= 524_288
+                })
+            })
+        },
+        "persisted multiview Paged target_b navigation to >= 524_288",
+    )
+    .await?;
+
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        if ws.session_layout().doc_view_count(doc_id) != 2 {
+            return Err("persisted multiview Paged did not preserve doc_view_count == 2".into());
+        }
+        if ws.paging_service.stats().sources != 1 {
+            return Err(format!(
+                "expected 1 shared paging source before split shutdown, got {}",
+                ws.paging_service.stats().sources
+            ));
+        }
+        let (_, vp_a) = ws
+            .paged_view(target_a.view_id)
+            .ok_or("persisted multiview target_a missing after target_b navigation")?;
+        if vp_a.current_slice.is_none() || vp_a.is_loading || vp_a.visible_byte_range().start != 0 {
+            return Err(format!(
+                "persisted multiview target_a mutated to {:?}",
+                vp_a.visible_byte_range()
+            ));
+        }
+        let (_, vp_b) = ws
+            .paged_view(target_b.view_id)
+            .ok_or("persisted multiview target_b missing after navigation")?;
+        if vp_b.current_slice.is_none()
+            || vp_b.is_loading
+            || vp_b.visible_byte_range().start < 524_288
+        {
+            return Err(format!(
+                "persisted multiview target_b did not retain >= 524_288 range: {:?}",
+                vp_b.visible_byte_range()
+            ));
+        }
+        ws.session_layout().validate().map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+async fn verify_multiview_paged_inner(
+    window: &AnyWindowHandle,
+    workspace: &Entity<EditorWorkspace>,
+    paged_path: &Path,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let (baseline_sources, baseline_panes) = cx.update(|cx| {
+        let ws = workspace.read(cx);
+        (
+            ws.paging_service.stats().sources,
+            ws.session_layout().panes().count(),
+        )
+    });
+    if baseline_sources != 0 {
+        return Err(format!(
+            "expected 0 active paging sources before multiview test, got {baseline_sources}"
+        ));
+    }
+
+    // 1) Open ~300 KiB file with temporary 256 KiB limit -> lands in Paged mode at byte 0.
+    window
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.cli.editable_byte_limit = Some(256 * 1024);
+                ws.open_path(paged_path.to_path_buf(), window, cx);
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && ws.active_view_id().is_some_and(|id| {
+                        ws.paged_view(id).is_some_and(|(src, vp)| {
+                            src.meta.path.as_deref() == Some(paged_path)
+                                && vp.current_slice.is_some()
+                                && !vp.is_loading
+                        })
+                    })
+            })
+        },
+        "multiview Paged initial viewport load",
+    )
+    .await?;
+
+    let target_1 = cx.update(|cx| -> Result<ViewTarget, String> {
+        let ws = workspace.read(cx);
+        let view_1 = ws.active_view_id().ok_or("missing active paged view_1")?;
+        let target_1 = ws
+            .view_target(view_1)
+            .ok_or("missing ViewTarget for view_1")?;
+        let (_, vp) = ws.paged_view(view_1).ok_or("view_1 missing paged_view")?;
+        if vp.visible_byte_range().start != 0 {
+            return Err(format!(
+                "expected initial paged offset 0, got {}",
+                vp.visible_byte_range().start
+            ));
+        }
+        if ws.session_layout().doc_view_count(target_1.document.doc_id) != 1 {
+            return Err("expected doc_view_count == 1 after initial paged open".into());
+        }
+        let sources = ws.paging_service.stats().sources;
+        if sources != 1 {
+            return Err(format!(
+                "expected 1 paging source after open, got {sources}"
+            ));
+        }
+        Ok(target_1)
+    })?;
+    let doc_id = target_1.document.doc_id;
+    focus_active_editor_or_workspace(window, workspace, cx)?;
+
+    // 2) SplitAndCloneActiveViewRight -> creates view_2 sharing exact same doc_id & PagedDocHandle.
+    dispatch_window_action(window, cx, SplitAndCloneActiveViewRight)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                let views = ws.session_layout().views_for_doc(doc_id);
+                views.len() == 2
+                    && views.iter().all(|vt| {
+                        ws.paged_view(vt.view_id)
+                            .is_some_and(|(_, vp)| vp.current_slice.is_some() && !vp.is_loading)
+                    })
+            })
+        },
+        "SplitAndCloneActiveViewRight secondary viewport hydration",
+    )
+    .await?;
+
+    let target_2 = cx.update(|cx| -> Result<ViewTarget, String> {
+        let ws = workspace.read(cx);
+        let views = ws.session_layout().views_for_doc(doc_id);
+        let target_2 = views
+            .into_iter()
+            .find(|vt| vt.view_id != target_1.view_id)
+            .ok_or("SplitAndCloneActiveViewRight did not create a distinct ViewId")?;
+        if target_2.document != target_1.document {
+            return Err("SplitAndCloneActiveViewRight did not share DocumentKey".into());
+        }
+        if ws.session_layout().pane_for_view(target_2.view_id)
+            == ws.session_layout().pane_for_view(target_1.view_id)
+        {
+            return Err("SplitAndCloneActiveViewRight did not place view_2 in a new pane".into());
+        }
+        if ws.active_view_id() != Some(target_2.view_id) {
+            return Err("SplitAndCloneActiveViewRight did not focus new view_2".into());
+        }
+        let sources = ws.paging_service.stats().sources;
+        if sources != 1 {
+            return Err(format!(
+                "SplitAndCloneActiveViewRight allocated an extra PagedDocHandle: sources={sources}"
+            ));
+        }
+        Ok(target_2)
+    })?;
+    pump_frame(window, cx)?;
+
+    // 3) Navigate view_2 to byte offset >= 200_000 while view_1 remains independently at 0.
+    window
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.request_paged_viewport(
+                    target_2,
+                    ViewportAnchor::ByteOffset(200_000),
+                    window,
+                    cx,
+                );
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                ws.paged_view(target_2.view_id).is_some_and(|(_, vp)| {
+                    !vp.is_loading && vp.visible_byte_range().start >= 200_000
+                })
+            })
+        },
+        "independent navigation of view_2 to byte offset >= 200_000",
+    )
+    .await?;
+
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        let (_, vp1) = ws
+            .paged_view(target_1.view_id)
+            .ok_or("view_1 missing after view_2 navigation")?;
+        if vp1.visible_byte_range().start != 0 {
+            return Err(format!(
+                "navigating view_2 mutated view_1 viewport offset to {}",
+                vp1.visible_byte_range().start
+            ));
+        }
+        Ok(())
+    })?;
+    focus_active_editor_or_workspace(window, workspace, cx)?;
+
+    // 4) Close secondary view (view_2) via CloseActiveTab: immediate fast-path, no dialog, view_1 intact.
+    dispatch_window_action(window, cx, CloseActiveTab)?;
+    pump_frame(window, cx)?;
+    cx.update(|cx| -> Result<(), String> {
+        let ws = workspace.read(cx);
+        if ws.pending_lifecycle_sequence().is_some() || ws.is_lifecycle_busy() {
+            return Err(
+                "closing secondary Paged view unexpectedly entered lifecycle/dialog".into(),
+            );
+        }
+        if ws.session_layout().doc_view_count(doc_id) != 1 {
+            return Err("closing secondary Paged view did not leave doc_view_count == 1".into());
+        }
+        if ws.session_layout().views.contains_key(&target_2.view_id)
+            || ws.paged_viewports.contains_key(&target_2.view_id)
+        {
+            return Err("secondary Paged view or viewport survived CloseActiveTab".into());
+        }
+        let (_, vp1) = ws
+            .paged_view(target_1.view_id)
+            .ok_or("primary view_1 lost after secondary close")?;
+        if vp1.visible_byte_range().start != 0 {
+            return Err("primary view_1 offset changed after secondary close".into());
+        }
+        if ws.paging_service.stats().sources != 1 {
+            return Err("closing secondary view dropped shared PagedDocHandle".into());
+        }
+        Ok(())
+    })?;
+
+    if cx.update(|cx| {
+        let ws = workspace.read(cx);
+        ws.pane_view_ids(ws.active_pane_id()) == Some(&[][..])
+            && ws.session_layout().panes().count() > baseline_panes
+    }) {
+        focus_active_editor_or_workspace(window, workspace, cx)?;
+        dispatch_window_action(window, cx, CloseActivePane)?;
+    }
+    pump_frame(window, cx)?;
+
+    // 5) Re-split/clone view_1 -> view_3 sharing doc_id.
+    window
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                if ws.active_view_id() != Some(target_1.view_id) {
+                    ws.activate_view(target_1, window, cx);
+                }
+            });
+        })
+        .map_err(|e| e.to_string())?;
+    focus_active_editor_or_workspace(window, workspace, cx)?;
+
+    dispatch_window_action(window, cx, SplitAndCloneActiveViewRight)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                let views = ws.session_layout().views_for_doc(doc_id);
+                views.len() == 2
+                    && views.iter().all(|vt| {
+                        ws.paged_view(vt.view_id)
+                            .is_some_and(|(_, vp)| vp.current_slice.is_some() && !vp.is_loading)
+                    })
+            })
+        },
+        "second SplitAndCloneActiveViewRight viewport hydration",
+    )
+    .await?;
+
+    let target_3 = cx.update(|cx| -> Result<ViewTarget, String> {
+        let ws = workspace.read(cx);
+        ws.session_layout()
+            .views_for_doc(doc_id)
+            .into_iter()
+            .find(|vt| vt.view_id != target_1.view_id)
+            .ok_or("second SplitAndCloneActiveViewRight missing view_3".into())
+    })?;
+    focus_active_editor_or_workspace(window, workspace, cx)?;
+
+    // 6) Truncate backing file on disk and ReloadActiveDocument -> ADR 009 shrink-to-Editable collapse.
+    std::fs::write(paged_path, "small_after_reload\n")
+        .map_err(|e| format!("truncate paged file for reload: {e}"))?;
+    cx.update(|cx| {
+        workspace.update(cx, |ws, _| {
+            ws.cli.editable_byte_limit = None;
+        });
+    });
+
+    dispatch_window_action(window, cx, ReloadActiveDocument)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && matches!(
+                        ws.active_slot(),
+                        Some(TabSlot::Editable(ed))
+                            if ed.doc_id != doc_id && ed.meta.path.as_deref() == Some(paged_path)
+                    )
+            })
+        },
+        "ReloadActiveDocument shrink-to-Editable collapse",
+    )
+    .await?;
+
+    // 7) Verify ADR 009 shrink-to-Editable invariants.
+    let (new_target, new_doc_id) = cx.update(|cx| -> Result<(ViewTarget, DocumentId), String> {
+        let ws = workspace.read(cx);
+        let active_id = ws
+            .active_view_id()
+            .ok_or("missing active view after shrink-to-Editable reload")?;
+        let new_target = ws
+            .view_target(active_id)
+            .ok_or("missing ViewTarget after reload")?;
+        let Some(TabSlot::Editable(ed)) = ws.active_slot() else {
+            return Err("reloaded small file did not land in TabSlot::Editable".into());
+        };
+        let new_doc_id = ed.doc_id;
+        if new_doc_id == doc_id {
+            return Err("ReloadActiveDocument kept old DocumentId instead of fresh one".into());
+        }
+        if ws.session_layout().doc_view_count(new_doc_id) != 1 {
+            return Err(format!(
+                "ADR 009 shrink-to-Editable left {} views instead of 1",
+                ws.session_layout().doc_view_count(new_doc_id)
+            ));
+        }
+        if ws.session_layout().doc_view_count(doc_id) != 0 || ws.documents.contains_key(&doc_id) {
+            return Err("old Paged document remained after shrink-to-Editable reload".into());
+        }
+        if ed.committed_rope().to_string() != "small_after_reload\n" {
+            return Err(format!(
+                "reloaded Editable content mismatch: {:?}",
+                ed.committed_rope().to_string()
+            ));
+        }
+        let collapsed_secondary = if new_target.view_id == target_3.view_id {
+            target_1.view_id
+        } else {
+            target_3.view_id
+        };
+        if ws.session_layout().views.contains_key(&collapsed_secondary)
+            || ws.paged_viewports.contains_key(&target_1.view_id)
+            || ws.paged_viewports.contains_key(&target_3.view_id)
+        {
+            return Err("secondary Paged view or viewport survived ADR 009 collapse".into());
+        }
+        if ws.paging_service.stats().sources != 0 {
+            return Err(
+                "old PagedDocHandle was not dropped after shrink-to-Editable reload".into(),
+            );
+        }
+        Ok((new_target, new_doc_id))
+    })?;
+
+    // 8) Cleanly close the temporary reloaded Editable tab and extra empty split pane.
+    focus_active_editor_or_workspace(window, workspace, cx)?;
+    dispatch_window_action(window, cx, CloseActiveTab)?;
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy()
+                    && !ws.session_layout().views.contains_key(&new_target.view_id)
+                    && !ws.documents.contains_key(&new_doc_id)
+            })
+        },
+        "closing temporary reloaded Editable tab",
+    )
+    .await?;
+
+    if cx.update(|cx| {
+        let ws = workspace.read(cx);
+        ws.session_layout().panes().count() > baseline_panes
+            && ws.pane_view_ids(ws.active_pane_id()) == Some(&[][..])
+    }) {
+        focus_active_editor_or_workspace(window, workspace, cx)?;
+        dispatch_window_action(window, cx, CloseActivePane)?;
+    }
+    wait_until_with_frames(
+        Duration::from_secs(10),
+        window,
+        cx,
+        |cx| {
+            cx.update(|cx| {
+                let ws = workspace.read(cx);
+                !ws.is_lifecycle_busy() && !ws.layout_dirty
+            })
+        },
+        "settling SessionLayout after multiview cleanup",
+    )
+    .await?;
+
+    let (recovery, settled_layout) = cx.update(|cx| -> Result<_, String> {
+        let ws = workspace.read(cx);
+        if ws.session_layout().panes().count() != baseline_panes {
+            return Err(format!(
+                "multiview cleanup left {} panes instead of {baseline_panes}",
+                ws.session_layout().panes().count()
+            ));
+        }
+        ws.session_layout().validate().map_err(|e| e.to_string())?;
+        Ok((
+            ws.recovery.clone().ok_or("missing recovery worker")?,
+            ws.session_layout().clone(),
+        ))
+    })?;
+    groups::wait_for_published_layout(&recovery, &settled_layout, cx).await?;
+
     Ok(())
 }
